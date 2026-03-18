@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.git/
+.venv/
+config.ini
+recordings/
+status.json
+status.json.tmp
+status.bak
+docs/
+nvidia.key
+*.deb
