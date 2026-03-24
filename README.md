@@ -106,13 +106,6 @@ docker inspect --format='{{json .State.Health}}' bili-recorder
 ```bash
 sed -i 's/^RoomId = .*/RoomId = 123456/' config.ini
 ```
-
-## Notes
-
-- 公开仓库不包含你的本地 `config.ini`、`recordings/`、`docs/` 和运行状态文件。
-- 首选运行方式是 Linux + Docker Compose。
-- 首次启动前请确认宿主机已安装 Docker，并能正常拉取基础镜像。
-
 ## License
 
 MIT
