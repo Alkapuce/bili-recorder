@@ -2,6 +2,7 @@ services:
   bili-recorder:
     build: .
     container_name: bili-recorder
+    network_mode: host
     restart: always
     volumes:
       - ./config.ini:/app/config.ini:ro

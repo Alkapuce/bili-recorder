@@ -7,10 +7,12 @@ import configparser
 import shutil
 from datetime import datetime
 from bilibili_api import live
+from bilibili_api.exceptions import ResponseCodeException
 import traceback
 import logging
 import glob
 import tempfile
+import httpx
 
 # 配置日志
 logging.basicConfig(
@@ -73,6 +75,20 @@ def update_status(room_id, is_live=False, is_recording=False, room_title="N/A", 
         write_status_atomic(status_info)
     except Exception as e:
         logger.warning(f"写入状态文件失败: {e}")
+
+
+async def refresh_heartbeat_periodically():
+    """主事件循环存活时刷新心跳，保留录制状态及错误信息。"""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                status_info = json.load(f)
+            status_info["heartbeat_ts"] = time.time()
+            status_info["updated_at"] = get_timestamp()
+            write_status_atomic(status_info)
+        except Exception as e:
+            logger.warning(f"刷新心跳失败: {e}")
 
 
 def sanitize_title(title):
@@ -152,9 +168,21 @@ def to_error_reason(exc, prefix):
 
 
 async def get_live_url_with_retry(room_id, max_retries=3):
-    """获取直播间真实流地址（带重试）。返回 (url, error_reason)。"""
+    """获取直播间真实流地址（带重试）。bilibili-api 优先，-352 时 curl 兜底。返回 (url, error_reason)。"""
     last_exc = None
+    curl_only = False
+
     for attempt in range(max_retries):
+        if curl_only:
+            url, fb_err = await _curl_get_play_url(room_id)
+            if url:
+                return url, ""
+            logger.warning(f"curl 兜底获取流地址失败 (尝试 {attempt + 1}/{max_retries}): {fb_err}")
+            last_exc = Exception(fb_err)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 * (2 ** attempt))
+            continue
+
         try:
             room = live.LiveRoom(room_id)
             info = await room.get_room_play_url()
@@ -162,10 +190,28 @@ async def get_live_url_with_retry(room_id, max_retries=3):
             return play_url, ""
         except Exception as e:
             last_exc = e
-            logger.warning(f"获取直播地址失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
+            logger.warning(f"bilibili-api 获取流地址失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+            if _is_352_error(e):
+                logger.info("bilibili-api 遇 -352 → 立即 curl 兜底获取流地址")
+                curl_only = True
+                url, fb_err = await _curl_get_play_url(room_id)
+                if url:
+                    logger.info("curl 兜底获取流地址成功")
+                    return url, ""
+                logger.warning(f"curl 兜底获取流地址也失败: {fb_err}，后续重试全部走 curl")
+                last_exc = Exception(fb_err)
 
+            backoff = 5 * (2 ** attempt) if (_is_352_error(e) or curl_only) else (2 ** attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(backoff)
+
+    if curl_only:
+        logger.error("get_live_url 最终失败：bilibili-api + curl 兜底均失败 → 视为风控")
+        return None, "live_url_352"
+
+    if last_exc and _is_352_error(last_exc):
+        logger.error("获取直播地址最终失败：B站风控(-352)，进入熔断等待")
+        return None, "live_url_352"
     if last_exc and is_dns_resolution_error(last_exc):
         logger.error("获取直播地址最终失败：DNS 解析临时失败，可能是网络波动")
     else:
@@ -174,10 +220,85 @@ async def get_live_url_with_retry(room_id, max_retries=3):
     return None, to_error_reason(last_exc or Exception("unknown"), "live_url")
 
 
+def _is_352_error(exc):
+    """检测是否为 B站 -352 风控错误。"""
+    return isinstance(exc, ResponseCodeException) and exc.code == -352
+
+
+# ── curl fallback（room/v1 接口，对未登录更宽容） ──────────────
+
+_CURL_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Referer": "https://live.bilibili.com/",
+    "Origin": "https://live.bilibili.com",
+}
+
+_curl_client = None
+
+def _get_curl_client():
+    global _curl_client
+    if _curl_client is None:
+        _curl_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    return _curl_client
+
+
+async def _curl_check_live(room_id):
+    """curl 兜底：通过 room/v1/Room/get_info 检查开播状态。"""
+    try:
+        client = _get_curl_client()
+        resp = await client.get(
+            "https://api.live.bilibili.com/room/v1/Room/get_info",
+            params={"room_id": str(room_id)},
+            headers=_CURL_HEADERS,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, "", f"curl_fallback_code_{data.get('code')}"
+        room_info = data.get("data") or {}
+        is_live = room_info.get("live_status") == 1
+        title = room_info.get("title", "")
+        return is_live, title, ""
+    except Exception as e:
+        return False, "", f"curl_fallback_{type(e).__name__}"
+
+
+async def _curl_get_play_url(room_id):
+    """curl 兜底：通过 room/v1/Room/playUrl 获取流地址。"""
+    try:
+        client = _get_curl_client()
+        resp = await client.get(
+            "https://api.live.bilibili.com/room/v1/Room/playUrl",
+            params={"cid": str(room_id), "qn": "10000", "platform": "web"},
+            headers=_CURL_HEADERS,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return None, f"curl_fallback_code_{data.get('code')}"
+        durl = (data.get("data") or {}).get("durl") or []
+        if not durl or not durl[0].get("url"):
+            return None, "curl_fallback_empty_durl"
+        return durl[0]["url"], ""
+    except Exception as e:
+        return None, f"curl_fallback_{type(e).__name__}"
+
+
 async def check_live_status_with_retry(room_id, max_retries=3):
-    """检查是否开播（带重试）。返回 (is_live, title, error_reason)。"""
+    """检查是否开播（带重试）。bilibili-api 优先，-352 时 curl 兜底。返回 (is_live, title, error_reason)。"""
     last_exc = None
+    curl_only = False  # 切换后全部重试走 curl
+
     for attempt in range(max_retries):
+        if curl_only:
+            is_live, title, fb_err = await _curl_check_live(room_id)
+            if not fb_err:
+                logger.info(f"curl 兜底成功 (live={is_live}, title={title})")
+                return is_live, title, ""
+            logger.warning(f"curl 兜底失败 (尝试 {attempt + 1}/{max_retries}): {fb_err}")
+            last_exc = Exception(fb_err)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 * (2 ** attempt))
+            continue
+
         try:
             room = live.LiveRoom(room_id)
             info = await room.get_room_info()
@@ -186,10 +307,29 @@ async def check_live_status_with_retry(room_id, max_retries=3):
             return is_live, title, ""
         except Exception as e:
             last_exc = e
-            logger.warning(f"检查直播状态失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
+            logger.warning(f"bilibili-api 状态检查失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
 
+            if _is_352_error(e):
+                logger.info("bilibili-api 遇 -352 → 立即 curl 兜底")
+                curl_only = True
+                is_live, title, fb_err = await _curl_check_live(room_id)
+                if not fb_err:
+                    logger.info(f"curl 兜底成功 (live={is_live}, title={title})")
+                    return is_live, title, ""
+                logger.warning(f"curl 兜底也失败: {fb_err}，后续重试全部走 curl")
+                last_exc = Exception(fb_err)
+
+            backoff = 5 * (2 ** attempt) if (_is_352_error(e) or curl_only) else (2 ** attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(backoff)
+
+    if curl_only:
+        logger.error("check_live_status 最终失败：bilibili-api + curl 兜底均失败 → 视为风控")
+        return False, "", "check_live_status_352"
+
+    if last_exc and _is_352_error(last_exc):
+        logger.error("检查直播状态最终失败：B站风控(-352)，进入熔断等待")
+        return False, "", "check_live_status_352"
     if last_exc and is_dns_resolution_error(last_exc):
         logger.error("检查直播状态最终失败：DNS 解析临时失败，可能是网络波动")
     else:
@@ -702,12 +842,24 @@ async def main():
     logger.info(f"加载配置文件: {config_path}")
     logger.info(f"正在监听房间: {room_id}，检查间隔: {interval}秒")
 
+    update_status(room_id)
+    heartbeat_task = asyncio.create_task(refresh_heartbeat_periodically())
+
     last_pulse = 0
+    consecutive_352 = 0        # 连续 -352 风控计数
+    max_352_backoff = 600      # 熔断最大等待秒数 (10分钟)
     while True:
         # 每轮读取配置，支持运行中切房间/改参数
         config = read_config(config_path)
         room_id = get_dynamic_room_id(config, room_id)
         interval = int(config['General'].get('CheckInterval', '60'))
+
+        # -352 风控熔断：连续触发时指数退避拉长间隔
+        if consecutive_352 > 0:
+            backoff = min(interval * (2 ** consecutive_352), max_352_backoff)
+            logger.info(f"B站风控熔断中 (连续 {consecutive_352} 次)，等待 {backoff}s...")
+            await asyncio.sleep(backoff)
+            consecutive_352 = 0  # 重置，等下一轮检查验证是否恢复
 
         max_recover_retries = int(config['Recording'].get('MaxRecoverRetries', '2'))
         recover_delay = int(config['Recording'].get('RecoverDelaySeconds', '15'))
@@ -729,6 +881,12 @@ async def main():
             room_title=title,
             last_error=live_status_error
         )
+
+        # -352 风控计数
+        if "_352" in live_status_error:
+            consecutive_352 += 1
+        else:
+            consecutive_352 = 0  # API 恢复正常，重置熔断计数
 
         if is_live:
             if not check_disk_space_or_warn(save_dir, min_free_space_gb):
@@ -760,7 +918,9 @@ async def main():
             while True:
                 current_file = build_output_file_path(config, session_title, session_tag=session_tag, part_index=part_index)
                 update_status(room_id, is_live=True, is_recording=True, room_title=session_title, current_file=current_file)
-                success, reason, record_file = record_stream(url, session_title, config, file_path=current_file)
+                success, reason, record_file = await asyncio.to_thread(
+                    record_stream, url, session_title, config, file_path=current_file
+                )
 
                 if os.path.exists(record_file) and os.path.getsize(record_file) > 0:
                     recorded_parts.append(record_file)
@@ -804,12 +964,16 @@ async def main():
                     break
 
             if recorded_parts:
-                merged_source, merge_reason = merge_recording_parts_if_needed(recorded_parts, config, session_tag, session_title)
+                merged_source, merge_reason = await asyncio.to_thread(
+                    merge_recording_parts_if_needed, recorded_parts, config, session_tag, session_title
+                )
                 if not merged_source:
                     update_status(room_id, is_live=False, is_recording=False, room_title="N/A", last_error=merge_reason)
                     logger.error(f"分段合并失败: {merge_reason}")
                 else:
-                    trans_ok, trans_reason = transcode_after_recording_if_enabled(merged_source, config)
+                    trans_ok, trans_reason = await asyncio.to_thread(
+                        transcode_after_recording_if_enabled, merged_source, config
+                    )
                     if not trans_ok:
                         update_status(room_id, is_live=False, is_recording=False, room_title="N/A", last_error=trans_reason)
 
