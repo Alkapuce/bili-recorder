@@ -1,6 +1,8 @@
 services:
   bili-recorder:
-    build: .
+    build:
+      context: .
+      network: host
     container_name: bili-recorder
     network_mode: host
     restart: always

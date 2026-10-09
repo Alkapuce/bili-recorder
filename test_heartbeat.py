@@ -17,6 +17,8 @@ class HeartbeatTest(unittest.IsolatedAsyncioTestCase):
         loop_thread = threading.get_ident()
         real_sleep = asyncio.sleep
         stages = []
+        processed = asyncio.Event()
+        checks = 0
 
         async def fast_sleep(seconds):
             await real_sleep(0.01)
@@ -45,15 +47,26 @@ class HeartbeatTest(unittest.IsolatedAsyncioTestCase):
 
         def transcode(*args):
             check_heartbeat("transcode")
+            loop.call_soon_threadsafe(processed.set)
             return True, "ok"
+
+        loop = asyncio.get_running_loop()
+
+        async def live_status(*args):
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                return True, "test", ""
+            if checks == 2:
+                return False, "", ""
+            await processed.wait()
+            raise RuntimeError("test complete")
 
         with tempfile.TemporaryDirectory() as tmp:
             config["General"]["SaveDir"] = tmp
             with patch.object(recorder, "STATUS_FILE", os.path.join(tmp, "status.json")), \
                  patch.object(recorder, "read_config", return_value=config), \
-                 patch.object(recorder, "check_live_status_with_retry", AsyncMock(
-                     side_effect=[(True, "test", ""), RuntimeError("test complete")]
-                 )), \
+                 patch.object(recorder, "check_live_status_with_retry", live_status), \
                  patch.object(recorder, "get_live_url_with_retry", AsyncMock(return_value=("test", ""))), \
                  patch.object(recorder, "cleanup_recordings_if_needed"), \
                  patch.object(recorder, "record_stream", record), \

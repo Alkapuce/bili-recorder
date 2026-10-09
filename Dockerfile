@@ -6,4 +6,6 @@ WORKDIR /app
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY recorder.py /app/recorder.py
+COPY quark_upload.py /app/quark_upload.py
+COPY session_store.py /app/session_store.py
 CMD ["python", "recorder.py"]

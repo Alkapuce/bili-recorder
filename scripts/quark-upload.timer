@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry pending Bili recording uploads every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=quark-upload.service
+
+[Install]
+WantedBy=timers.target

@@ -12,6 +12,7 @@ recordings/
 status.json
 status.json.tmp
 status.bak
+.quarkclouddrive/
 docs/
 nvidia.key
 
