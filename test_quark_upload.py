@@ -8,9 +8,96 @@ import unittest
 from unittest.mock import patch
 
 import quark_upload
+from cloud_sync import completed_files
 
 
 class UploadTest(unittest.TestCase):
+    def test_mirror_add_rename_replace_delete_and_failure_preserves_cloud(self):
+        class Cloud:
+            def __init__(self):
+                self.rows = {}
+
+            def target_id(self):
+                return "target"
+
+            def files(self):
+                return {key: dict(value) for key, value in self.rows.items()}
+
+            def rename(self, old, new):
+                self.rows[new] = self.rows.pop(old)
+
+            def remove(self, names):
+                for name in names:
+                    del self.rows[name]
+
+        cloud = Cloud()
+        calls = []
+
+        def upload(path, options, record, *args):
+            calls.append(path.name)
+            cloud.rows[path.name] = {"size": path.stat().st_size, "is_dir": False}
+            record.update(status="uploaded", file_id=str(len(calls)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            config = folder / "config.ini"
+            config.write_text(f"[General]\nSaveDir={tmp}\n[Upload]\nEnabled=true\n"
+                              "AlistCredentials=private.json\nParentFid=target\n")
+            first = folder / "first.mp4"
+            first.write_bytes(b"complete")
+            (folder / "active_part001.mp4").write_bytes(b"recording")
+            (folder / "job.transcoded.mp4").write_bytes(b"not published")
+            (folder / "job.partial.mp4").write_bytes(b"partial")
+            with patch.object(quark_upload, "Alist", return_value=cloud), \
+                 patch.object(quark_upload, "upload_file", side_effect=upload), \
+                 patch.object(quark_upload, "recover_interrupted_upload"):
+                quark_upload.main(config)
+                self.assertEqual(calls, ["first.mp4"])
+                second = folder / "renamed.mp4"
+                first.rename(second)
+                quark_upload.main(config)
+                self.assertEqual(calls, ["first.mp4"])
+                self.assertEqual(set(cloud.rows), {second.name})
+                second.write_bytes(b"replaced")  # Same size; must compare content, too.
+                with patch.object(quark_upload, "upload_file", side_effect=RuntimeError("offline")):
+                    with self.assertRaisesRegex(RuntimeError, "1 个文件待重试"):
+                        quark_upload.main(config)
+                self.assertTrue(any(key.startswith(".previous-") for key in cloud.rows))
+                quark_upload.main(config)
+                self.assertEqual(set(cloud.rows), {second.name})
+                cloud.rows.clear()  # A remote deletion is repaired from local content.
+                quark_upload.main(config)
+                self.assertIn(second.name, cloud.rows)
+                second.unlink()
+                quark_upload.main(config)
+                self.assertEqual(cloud.rows, {})
+                self.assertEqual(completed_files(folder), set())
+                first.write_bytes(b"new pending upload")
+                with patch.object(quark_upload, "upload_file", side_effect=RuntimeError("offline")):
+                    with self.assertRaises(RuntimeError):
+                        quark_upload.main(config)
+                first.unlink()
+                quark_upload.main(config)
+                self.assertEqual(cloud.rows, {})
+                with patch.object(cloud, "target_id", return_value="wrong-directory"):
+                    with self.assertRaisesRegex(ValueError, "同一个夸克子目录"):
+                        quark_upload.main(config)
+
+    def test_completed_files_excludes_declared_sources_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "recording.mp4"
+            source.write_bytes(b"active")
+            (folder / "symlink.mp4").symlink_to(source)
+            config = configparser.ConfigParser()
+            config.read_dict({"General": {"SaveDir": tmp}})
+            from session_store import SessionStore
+            store = SessionStore(tmp)
+            session = store.create(config, 1, "test", "title")
+            session["parts"] = [str(source)]
+            store.save(session)
+            self.assertEqual(completed_files(folder), set())
+
     def test_retry_resume_and_no_duplicate_upload(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -37,9 +124,9 @@ sys.exit(1 if failed else 0)
             config_path = folder / "config.ini"
             with config_path.open("w") as f:
                 config.write(f)
-            final = folder / "session.transcoded.mp4"
+            final = folder / "session.mp4"
             final.write_bytes(b"completed")
-            (folder / "session.transcoded.partial.mp4").write_bytes(b"not complete")
+            (folder / "session.partial.mp4").write_bytes(b"not complete")
             with self.assertRaisesRegex(RuntimeError, "1 个文件待重试"):
                 quark_upload.main(str(config_path))
             state = json.loads((folder / ".quark-upload" / "manifest.json").read_text())
@@ -76,7 +163,7 @@ sys.exit(1 if failed else 0)
             for sub in ["failed", "success"]:
                 (folder / sub).mkdir()
                 (folder / sub / "same.mp4").write_bytes(b"archive")
-            (folder / "active.mp4").write_bytes(b"still recording")
+            (folder / "active_part001.mp4").write_bytes(b"still recording")
             config = configparser.ConfigParser()
             config.read_dict({"General": {"SaveDir": tmp}, "Upload": {
                 "Enabled": "true", "QuarkCli": str(cli), "Node": sys.executable}})
@@ -91,14 +178,14 @@ sys.exit(1 if failed else 0)
             state = json.loads((folder / ".quark-upload" / "manifest.json").read_text())
             self.assertEqual(state["failed/same.mp4"]["status"], "pending")
             self.assertEqual(state["success/same.mp4"]["status"], "uploaded")
-            self.assertNotIn("active.mp4", state)
+            self.assertNotIn("active_part001.mp4", state)
             with self.assertRaises(ValueError):
                 quark_upload.main(str(config_path), enqueue=outside)
 
     def test_reconcile_completed_task_after_worker_stopped_before_ledger_save(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
-            path = folder / 'session.transcoded.mp4'
+            path = folder / 'session.mp4'
             path.write_bytes(b'complete')
             root = folder / 'root.jsonl'
             root.write_text(json.dumps({'filename':'Uploads','category':0,'fid':'parent'}))

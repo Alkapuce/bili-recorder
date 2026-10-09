@@ -20,7 +20,7 @@ ensure_runtime_files() {
   fi
 
   if ! awk -F= '
-    /^[[:space:]]*RoomId[[:space:]]*=/ {
+    tolower($1) ~ /^[[:space:]]*roomid[[:space:]]*$/ {
       gsub(/[[:space:]]/, "", $2)
       if ($2 ~ /^[1-9][0-9]*$/) found=1
     }
@@ -78,6 +78,18 @@ fi
 
 if [ "${1:-}" = "up" ] || [ "${1:-}" = "start" ] || [ "${1:-}" = "run" ]; then
   ensure_runtime_files
+fi
+
+# Compose's Bake backend requires an explicit grant for the configured host build network.
+if [[ " $* " == *" --build "* ]]; then
+  docker compose "${COMPOSE_FILES[@]}" build --print |
+    docker buildx bake --allow=network.host --load -f -
+  ARGS=()
+  for arg in "$@"; do
+    if [ "$arg" = "--build" ]; then arg="--no-build"; fi
+    ARGS+=("$arg")
+  done
+  set -- "${ARGS[@]}"
 fi
 
 exec docker compose "${COMPOSE_FILES[@]}" "$@"

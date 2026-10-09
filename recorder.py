@@ -6,6 +6,7 @@ import time
 import configparser
 import shutil
 from datetime import datetime
+from pathlib import Path
 from bilibili_api import live
 from bilibili_api.exceptions import ResponseCodeException
 import traceback
@@ -346,7 +347,7 @@ def build_output_file_path(config, title, session_tag=None, part_index=1):
 
     timestamp = session_tag or get_timestamp()
     safe_title = sanitize_title(title)
-    part_suffix = f"_part{part_index:03d}" if part_index > 1 else ""
+    part_suffix = f"_part{part_index:03d}"
     filename = f"{timestamp}_{safe_title}{part_suffix}.{config['Recording']['Format']}"
     return os.path.join(save_dir, filename)
 
@@ -864,15 +865,30 @@ def transcode_after_recording_if_enabled(record_file, config):
 async def process_recording_session(parts, config, session_tag, session_title):
     """串行处理已下播的场次，不阻塞下一场的录制。"""
     try:
+        extension = config['PostProcess'].get('OutputFormat', 'mp4')
+        final = os.path.join(config['General']['SaveDir'],
+                             f"{session_tag}_{sanitize_title(session_title)}.{extension}")
+        enabled = config['PostProcess'].getboolean('TranscodeEnabled', fallback=True)
+        if enabled and os.path.exists(final):
+            if Path(final).resolve() in {Path(part).resolve() for part in parts}:
+                logger.error(f"最终文件名与原流冲突，保留源文件: {final}")
+                return False
+            return await asyncio.to_thread(lambda: validate_transcoded_file(final, source_files=parts)[0])
         source, reason = await asyncio.to_thread(
             merge_recording_parts_if_needed, parts, config, session_tag, session_title
         )
         if reason == "incompatible_video_streams":
-            return await asyncio.to_thread(transcode_mixed_session, parts, config, session_tag, session_title)
-        if source:
+            ok = await asyncio.to_thread(transcode_mixed_session, parts, config, session_tag, session_title)
+            output = os.path.splitext(build_merged_file_path(config, session_tag, session_title))[0] + '.transcoded.mp4'
+        elif source:
             ok, reason = await asyncio.to_thread(transcode_after_recording_if_enabled, source, config)
-            if ok:
-                return True
+            output = f"{os.path.splitext(source)[0]}.transcoded.{extension}"
+        else:
+            ok = False
+        if ok:
+            if enabled:
+                os.replace(output, final)
+            return True
         logger.error(f"录制会话后处理失败，保留源文件: {session_tag}, {reason}")
     except Exception:
         logger.exception(f"录制会话后处理异常，保留源文件: {session_tag}")
@@ -993,11 +1009,11 @@ def cleanup_recordings_if_needed(config):
         files.extend(glob.glob(os.path.join(save_dir, f"*.{ext}")) )
 
     # Raw parts and partial outputs are recovery inputs, never retention-cleanup candidates.
-    files = [f for f in files if os.path.isfile(f) and f.endswith('.transcoded.mp4')]
+    from cloud_sync import completed_files
+    completed = completed_files(Path(save_dir))
+    files = [f for f in files if Path(f) in completed]
     if upload_enabled:
-        from pathlib import Path
-        files = [f for f in files if not f.endswith('.transcoded.mp4')
-                 or not upload_pending(Path(f), upload_ledger)]
+        files = [f for f in files if not upload_pending(Path(f), upload_ledger)]
     files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
 
     now = time.time()
@@ -1015,10 +1031,9 @@ def cleanup_recordings_if_needed(config):
     files = []
     for ext in exts:
         files.extend(glob.glob(os.path.join(save_dir, f"*.{ext}")) )
-    files = [f for f in files if os.path.isfile(f) and f.endswith('.transcoded.mp4')]
+    files = [f for f in files if Path(f) in completed and os.path.isfile(f)]
     if upload_enabled:
-        files = [f for f in files if not f.endswith('.transcoded.mp4')
-                 or not upload_pending(Path(f), upload_ledger)]
+        files = [f for f in files if not upload_pending(Path(f), upload_ledger)]
 
     if keep_days > 0:
         max_age = keep_days * 86400

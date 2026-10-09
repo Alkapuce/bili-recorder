@@ -11,6 +11,8 @@ import secrets
 import subprocess
 import time
 
+from cloud_sync import Alist, completed_files, finish_sync, reconcile
+
 
 def save_json(path, data):
     temporary = path.with_suffix(".tmp")
@@ -114,6 +116,8 @@ def main(config_path="config.ini", enqueue=None):
     if not config.getboolean("Upload", "Enabled", fallback=False):
         return
     folder = Path(config["General"]["SaveDir"]).resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(folder)
     state_dir = folder / ".quark-upload"
     state_dir.mkdir(exist_ok=True)
     with (state_dir / "lock").open("w") as lock:
@@ -136,27 +140,50 @@ def main(config_path="config.ini", enqueue=None):
                     ledger.setdefault(key, {})["status"] = "pending"
             save_json(ledger_path, ledger)
             return
-        paths = set(folder.glob("*.transcoded.mp4"))
+        paths = completed_files(folder)
         paths.update(folder / key for key, record in ledger.items() if record.get("status") != "uploaded")
+        credentials = config["Upload"].get("AlistCredentials", "").strip()
+        cloud = Alist(credentials) if credentials else None
+        if cloud and not config["Upload"].get("ParentFid", "").strip():
+            raise ValueError("镜像同步必须指定夸克目标目录 ParentFid")
+        if cloud:
+            target_id = cloud.target_id()
+            if target_id in ("", "0") or target_id != config["Upload"]["ParentFid"].strip():
+                raise ValueError("AList 账号基本路径必须指向同一个夸克子目录，禁止同步根目录")
+        remote = cloud.files() if cloud else None
+        snapshots = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                     for p in completed_files(folder)}
         session_id = f"{int(time.time())}-{secrets.token_hex(3)}"
         failures = []
         for path in sorted(paths):
             key = path.resolve().relative_to(folder).as_posix()
             if not path.is_file():
+                if cloud:
+                    continue
                 failures.append(key)
                 logging.error("待上传文件缺失，保留任务: %s", key)
                 continue
-            if not upload_pending(path, ledger, key):
+            if not cloud and not upload_pending(path, ledger, key):
                 continue
             stat = path.stat()
-            with path.open("rb") as source:
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
+            previous = ledger.get(key, {})
+            digest = previous.get("sha256") if (previous.get("size"), previous.get("mtime_ns")) == (
+                stat.st_size, stat.st_mtime_ns) else None
+            if not digest:
+                with path.open("rb") as source:
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
+            if cloud:
+                reconcile(path, digest, ledger, cloud, remote)
+                save_json(ledger_path, ledger)
+                if not upload_pending(path, ledger, key):
+                    continue
             record = ledger.setdefault(key, {})
-            if record.get("sha256") != digest.hexdigest():
+            if record.get("sha256") != digest:
                 record.clear()
-            record.update(sha256=digest.hexdigest(), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+            record.update(sha256=digest, size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                           status="pending")
             save_json(ledger_path, ledger)
             try:
@@ -177,6 +204,9 @@ def main(config_path="config.ini", enqueue=None):
                 failures.append(key)
         if failures:
             raise RuntimeError(f"{len(failures)} 个文件待重试: {', '.join(failures)}")
+        if cloud:
+            finish_sync(folder, snapshots, ledger, cloud)
+            save_json(ledger_path, ledger)
 
 
 if __name__ == "__main__":

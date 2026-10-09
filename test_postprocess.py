@@ -173,6 +173,17 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
 
 
 class PostprocessTest(unittest.TestCase):
+    def test_final_name_collision_preserves_original_recording(self):
+        config = recorder.read_config('config.example.ini')
+        with tempfile.TemporaryDirectory() as tmp:
+            config['General']['SaveDir'] = tmp
+            source = os.path.join(tmp, 'test_title.mp4')
+            with open(source, 'wb') as stream:
+                stream.write(b'original recording')
+            self.assertFalse(asyncio.run(recorder.process_recording_session([source], config, 'test', 'title')))
+            with open(source, 'rb') as stream:
+                self.assertEqual(stream.read(), b'original recording')
+
     def test_session_state_rejects_paths_outside_recordings(self):
         config = recorder.read_config('config.example.ini')
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,7 +254,7 @@ class PostprocessTest(unittest.TestCase):
                     worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)
             asyncio.run(process())
-            output = os.path.join(tmp, 'test_title.transcoded.mp4')
+            output = os.path.join(tmp, 'test_title.mp4')
             self.assertEqual(recorder.ffprobe_video_info(output)['codec_name'], 'av1')
             self.assertEqual(audio, audio_bytes(output))
             self.assertFalse(os.path.exists(recording))
@@ -266,7 +277,7 @@ class PostprocessTest(unittest.TestCase):
             self.assertEqual(recorder.merge_recording_parts_if_needed(parts, config, 'test', 'mixed'),
                              (None, 'incompatible_video_streams'))
             self.assertTrue(asyncio.run(recorder.process_recording_session(parts, config, 'test', 'mixed')))
-            output = os.path.join(tmp, 'test_mixed.merged.transcoded.mp4')
+            output = os.path.join(tmp, 'test_mixed.mp4')
             self.assertEqual(recorder.ffprobe_video_info(output)['codec_name'], 'av1')
             def audio_bytes(path):
                 return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', path, '-map', '0:a',
@@ -280,7 +291,7 @@ class PostprocessTest(unittest.TestCase):
         config["Maintenance"]["KeepCount"] = "0"
         with tempfile.TemporaryDirectory() as tmp:
             config["General"]["SaveDir"] = tmp
-            final = os.path.join(tmp, "session.transcoded.mp4")
+            final = os.path.join(tmp, "session.mp4")
             with open(final, "wb") as f:
                 f.write(b"uploaded")
             os.utime(final, (1, 1))
@@ -290,7 +301,7 @@ class PostprocessTest(unittest.TestCase):
             os.mkdir(state_dir)
             stat = os.stat(final)
             with open(os.path.join(state_dir, "manifest.json"), "w") as f:
-                json.dump({"session.transcoded.mp4": {
+                json.dump({"session.mp4": {
                     "status": "uploaded", "size": stat.st_size, "mtime_ns": stat.st_mtime_ns
                 }}, f)
             recorder.cleanup_recordings_if_needed(config)

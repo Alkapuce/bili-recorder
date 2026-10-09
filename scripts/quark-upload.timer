@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry pending Bili recording uploads every five minutes
+Description=Sync finalized Bili recordings every five minutes
 
 [Timer]
 OnBootSec=2min
