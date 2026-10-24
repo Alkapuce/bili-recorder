@@ -12,7 +12,14 @@ class SessionStore:
     def save(self, session):
         path = self.directory / f"{session['tag']}.json"
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+        snapshot = {**session, "version": 2,
+                    "config": {section: dict(options) for section, options in session["config"].items()}}
+        snapshot["config"]["General"]["savedir"] = "."
+        if "PostProcess" in snapshot["config"]:
+            snapshot["config"]["PostProcess"].pop("lockfile", None)
+        snapshot["parts"] = [Path(part).resolve().relative_to(self.directory.parent).as_posix()
+                             for part in session["parts"]]
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
 
     def load(self):
@@ -22,6 +29,11 @@ class SessionStore:
             session = json.loads(path.read_text(encoding="utf-8"))
             if session['tag'] != path.stem or session['state'] not in {'recording', 'pending', 'complete'}:
                 raise ValueError(f"场次记录无效，保留现场: {path}")
+            if session.get("version") == 2:
+                if any(Path(part).is_absolute() for part in session["parts"]):
+                    raise ValueError(f"场次分段必须为相对路径: {path}")
+                session["config"]["General"]["savedir"] = str(self.directory.parent)
+                session["parts"] = [str(self.directory.parent / part) for part in session["parts"]]
             if Path(self.config(session)['General']['SaveDir']).resolve() != self.directory.parent:
                 raise ValueError(f"场次目录与当前录制目录不一致: {path}")
             for part in session['parts']:
@@ -47,6 +59,6 @@ class SessionStore:
 
     @staticmethod
     def config(session):
-        config = configparser.ConfigParser()
+        config = configparser.ConfigParser(interpolation=None)
         config.read_dict(session["config"])
         return config

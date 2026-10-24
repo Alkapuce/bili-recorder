@@ -1,5 +1,5 @@
 [Unit]
-Description=Sync finalized Bili recordings every five minutes
+Description=Archive finalized Bili recordings every five minutes
 
 [Timer]
 OnBootSec=2min

@@ -1,11 +1,12 @@
 """Mirror finalized videos through a directory-scoped AList account."""
 import json
+import hashlib
 from pathlib import Path
 import re
 import secrets
 import urllib.request
 
-from session_store import SessionStore
+from .session_store import SessionStore
 
 
 def completed_files(folder):
@@ -56,6 +57,23 @@ class Alist:
 
     def target_id(self):
         return self.call("fs/get", {"path": "/"})["id"]
+
+    def verify(self, path, record):
+        """Read cloud bytes independently of the upload response before local deletion."""
+        row = self.files().get(path.name, {})
+        if row.get("is_dir") or row.get("size") != record["size"]:
+            raise RuntimeError("云端文件不存在或大小不一致，保留本地文件")
+        details = self.call("fs/get", {"path": "/" + path.name, "refresh": True})
+        if details.get("id") != record.get("file_id") or details.get("size") != record["size"]:
+            raise RuntimeError("云端文件身份或大小不一致，保留本地文件")
+        digest = hashlib.sha256()
+        size = 0
+        with urllib.request.urlopen(details["raw_url"], timeout=120) as response:
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        if size != record["size"] or digest.hexdigest() != record["sha256"]:
+            raise RuntimeError("云端回读 SHA256 不一致，保留本地文件")
 
     def rename(self, old, new):
         for name in (old, new):

@@ -8,12 +8,19 @@ __pycache__/
 .python-version
 
 config.ini
+config/*
+!config/example.ini
+.runtime/
+*.egg-info/
+build/
+dist/
+*.lock.tmp
+config/*.lock
 recordings/
 status.json
 status.json.tmp
 status.bak
 .quarkclouddrive/
-docs/
 nvidia.key
 
 *.deb

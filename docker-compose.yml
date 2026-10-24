@@ -3,14 +3,15 @@ services:
     build:
       context: .
       network: host
-    container_name: bili-recorder
-    network_mode: host
+    init: true
     restart: always
     volumes:
-      - ./config.ini:/app/config.ini:ro
+      - ./config:/app/config:ro
       - ./recordings:/app/recordings
+      - ./.runtime:/app/.runtime
+    stop_grace_period: 60s
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import json,time,sys; d=json.load(open(\"/app/status.json\",\"r\",encoding=\"utf-8\")); sys.exit(0 if time.time()-float(d.get(\"heartbeat_ts\",0))<180 else 1)' || exit 1"]
+      test: ["CMD", "bili-recorder", "health"]
       interval: 60s
       timeout: 10s
       retries: 3

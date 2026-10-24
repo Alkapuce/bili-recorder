@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bili-recorder"
+version = "0.2.0"
+description = "Multi-process Bilibili live recorder with durable AV1 and Quark archival"
+requires-python = ">=3.10"
+dependencies = ["bilibili-api-python", "httpx"]
+
+[project.scripts]
+bili-recorder = "bili_recorder.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

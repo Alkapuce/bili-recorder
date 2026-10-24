@@ -1,169 +1,159 @@
 # Bili Recorder
 
-一个面向 Linux 服务器的 B 站直播录制工具，主打长期后台运行和尽量少人工介入。
+Linux 上的 B 站直播录制程序。每个直播间由独立进程录制，同场断流分段在确认下播后合成一个文件，可自动转码、上传夸克并在云端核验通过后删除本地文件。
 
-适合作为 Docker 常驻服务使用，支持开播检测、自动录制、断线恢复、录后转码和基础磁盘清理。
+- 多房间同时录制、按房间启停、状态查询，重复进程会被目录锁拒绝。
+- 同场分段与配置快照持久化；停止和重启继续原场次，查询失败不会被当成下播。
+- 默认视频 AV1，音频直接复制。后台转码在各房间之间串行执行，不阻塞其他房间录制。
+- 上传支持断点续传；归档模式永久保留云端文件，删除本地前独立回读云端文件核对 SHA256。
+- 配置、凭据、录像和运行状态留在本地，不进入 Git 或镜像。
 
-## Features
+## 安装与配置
 
-- 自动轮询直播状态，开播后开始录制
-- 同场断流、重试耗尽后继续收集分段，确认下播后自动合并
-- 后台串行转码为 AV1，音频直接复制，继续监听下一场直播
-- 周期写入 `status.json`，配合 Docker healthcheck 做存活检测
-- 支持运行中修改 `config.ini`，无需重启即可切换 `RoomId`
-- 支持按磁盘剩余空间、文件数量、保留天数做基础清理
-
-## Tech Stack
-
-- Python 3.10
-- `bilibili-api-python`
-- FFmpeg / FFprobe
-- Docker Compose
-- Optional NVIDIA NVENC
-
-## Quick Start
-
-1. 准备配置文件
+需要 Python >=3.10、FFmpeg / FFprobe（含 `libsvtav1`）；NVIDIA AV1 NVENC 可选。
 
 ```bash
-cp config.example.ini config.ini
+uv sync --locked
+cp config/example.ini config/local.ini
+chmod 600 config/local.ini
 ```
 
-2. 编辑 `config.ini`，至少填写真实的 `RoomId`
+编辑 `config/local.ini`，删除两个禁用的示例房间，添加真实直播间：
 
-3. 启动服务
+```ini
+[Room:123456]
+Enabled = true
 
-```bash
-./scripts/up.sh
+[Room:654321]
+Enabled = true
 ```
 
-查看状态：
+公共参数由 `[General]`、`[Recording]`、`[PostProcess]`、`[Maintenance]` 和 `[Upload]` 提供。
+每个房间可覆盖 `SaveDir`、`CheckInterval`、`ParentFid`。默认文件保存在 `SaveDir/房间号/`；各房间目录禁止相同或互相嵌套。路径相对于**配置文件所在目录**，例如 `config/local.ini` 中 `SaveDir=../recordings`。
 
 ```bash
+uv run bili-recorder check
+uv run bili-recorder run
+```
+
+`run` 前台监督所有已启用房间，异常退出的房间五秒后重启。编辑 `Enabled` 或以下命令可控制正在运行的监督进程：
+
+```bash
+uv run bili-recorder stop 123456
+uv run bili-recorder start 123456
+uv run bili-recorder status
+```
+
+停止一个房间时，其 FFmpeg 收尾退出，场次保留，其他房间继续录制。`start/stop` 修改本地配置；须先运行监督进程。若想在独立终端分别管理进程：
+
+```bash
+uv run bili-recorder run --room 123456
+uv run bili-recorder run --room 654321
+```
+
+独立模式用 Ctrl+C 停止；配置里的 `Enabled` 仅控制监督模式。同一房间不能同时被两种模式占用。更改输出目录、状态目录后须停止并重新启动；进行中的场次始终沿用开始录制时的配置快照。
+
+可用 `--config /path/to/local.ini`（放在子命令之前）或 `BILI_CONFIG_PATH` 指定其他配置。旧的单房间 `[General] RoomId` 配置仍可读取，其 SaveDir 布局保持不变。
+
+## 一场直播一个文件
+
+录制阶段直接保存原流；FFmpeg 退出后继续检查是否仍在直播。断流重连、重试次数耗尽、接口暂时出错均保留同一场次，直到成功查询到下播。
+
+后台按顺序合并分段、转码并核验时长与音轨，原子发布 `开始时间_房间号_直播标题.mp4`。只有发布成功后才按 `KeepSource` 清理源分段。状态与恢复记录在各房间目录的 `.sessions/`，未完成文件不会上传或参与保留期清理。
+
+默认优先探测 `av1_nvenc`，不可用时用 `libsvtav1`（CRF 34、preset 6、10 bit、2 个编码线程），音频复制，MP4 索引前置。视频规格变化时统一为较小尺寸、30 fps 的 AV1 再合并；音轨规格变化时保留分段并报错，避免静默损失音频。`TranscodeEnabled=false` 时合并并封装为配置的输出格式。
+
+多个房间共享转码锁，同时仍可录制。每个场次处理失败五分钟后重试；后处理队列积压时要留足磁盘。没有场次清单的历史散落文件不能自动猜测分组。
+
+## 夸克归档与本地删除
+
+在宿主机安装并授权夸克 `quarkclouddrive` CLI，填入本机 Node、CLI 路径与目标目录 FID：
+
+```ini
+[Upload]
+Enabled = true
+Mode = archive
+DeleteLocal = true
+Node = /path/to/node
+QuarkCli = /path/to/quark-drive.cjs
+ParentFid = your-target-folder-fid
+AlistCredentials = /path/to/private-alist.json
+```
+
+`DeleteLocal=true` 需要 AList 的夸克驱动及一个**基本路径严格限定为同一目标目录**的账号。凭据 JSON 格式为 `{"url":"http://127.0.0.1:5244","username":"...","password":"..."}`，权限设为 `600`，不提交 Git。
+
+```bash
+uv run bili-recorder upload
+# 单个房间或显式加入已整理的历史 MP4
+uv run bili-recorder upload --room 123456
+uv run bili-recorder upload --room 123456 --enqueue /absolute/path/inside/that/room/archive
+```
+
+上传失败时保留本地文件并在下一次调用续传。删除前必须同时满足：
+
+1. 官方 CLI 返回成功、文件 ID 和大小，并保存上传回执。
+2. AList 重新查询云端目录，核对文件 ID、大小，并完整读取云端文件核对 SHA256。
+3. 再次核对本地 SHA256、大小、修改时间和文件身份。
+
+任何一步失败均保留本地文件。核验回执先落盘再删除，崩溃后可继续收尾；记录保留在 `.quark-upload/manifest.json`。云端完整回读会额外消耗约一份录像大小的下载流量。上传器只自动扫描最终 MP4；其他输出格式须自行归档。
+
+`Mode=archive` 从不删除或改名云端文件。旧的本地镜像同步需显式设置 `Mode=mirror`，并使用独立云目录的单房间配置；此模式会传播本地改名与删除，**禁止同时使用 DeleteLocal**。云端目录应由本项目专用，尤其是镜像模式。
+
+`DeleteLocal=false` 可以只上传并保留本地，不要求 AList；这种情况下仅核对上传回执，不作云端回读核验。官方 CLI 渠道认证所需的环境变量由各自部署提供，不写入公共程序。
+
+## 后台运行
+
+Docker 负责录制与后处理，上传在能访问夸克 CLI 授权信息的宿主机执行：
+
+```bash
+./scripts/up.sh                   # 自动探测 GPU，构建并启动
 ./scripts/up.sh ps
 docker compose logs -f bili-recorder
-```
-
-停止服务：
-
-```bash
 ./scripts/up.sh down
 ```
 
-`./scripts/up.sh` 会自动探测宿主机 GPU。可用时叠加 `docker-compose.gpu.yml`，不可用时自动回退 CPU 模式。
+使用目录挂载配置，宿主机修改 `config/local.ini` 后可热读取。不要复制含个人配置的目录进镜像。`scripts/up.sh` 会叠加可选的本地 `config/compose.local.yml`，可放网络模式等部署专属配置。Docker Compose 通过 `bili-recorder health` 检查已启用房间的心跳；状态在 `.runtime/房间号/status.json`。`init: true` 负责回收子进程。
 
-## Configuration
-
-配置文件示例见 `config.example.ini`。
-
-### `[General]`
-
-- `RoomId`: 要监听的直播间号
-- `CheckInterval`: 轮询间隔，单位秒
-- `SaveDir`: 录制输出目录
-- `MinFreeSpaceGB`: 最低剩余磁盘阈值，小于该值时跳过新录制
-
-### `[Recording]`
-
-- `Format`: 原始录制格式，支持 `flv` / `mp4` / `mkv`
-- `VideoEncoder` / `AudioEncoder`: 原始录制阶段的编码方式
-- `StallTimeoutSeconds`: 文件长时间不增长时判定为卡死
-- `MaxRecoverRetries`: 录制异常后的自动恢复次数
-
-### `[PostProcess]`
-
-- `TranscodeEnabled`: 是否启用录后转码
-- `AutoPreferNvenc`: 自动优先 NVENC
-- `VideoEncoder` / `FallbackVideoEncoder`: CPU 转码主编码器与回退编码器
-- `OutputFormat`: 转码输出格式
-- `KeepSource`: 转码成功后是否保留源文件
-
-默认录制策略是视频、音频均 `copy`，原流码率由直播源决定。
-后处理默认使用 AV1：可用时 `av1_nvenc` CQ 34 / p5，否则
-`libsvtav1` CRF 34 / preset 6 / 10-bit，`CpuThreads = 2` 限制 SVT 的并行度。
-默认输出 MP4，索引前置，关键帧间隔 60 帧。分辨率和帧率保留，音频始终 `copy`。CRF 控制质量，输出码率和大小随画面变化。
-AV1 编码失败保留源文件，不自动改成 H.264/HEVC。
-
-录制进程退出后重新检查直播状态；查询失败继续保留当前场次，确认下播后再合并。
-视频规格一致时先无损合并；H.264/HEVC、尺寸或帧率变化时先统一为 AV1 再合并，
-此时使用较小分段的尺寸、30 fps，音频仍直接复制。音轨格式变化时保留分段并报错，避免损失音质。
-合并和转码都检查时长及音轨参数，校验通过后按 `KeepSource` 删除对应源文件。
-未正常关闭的 FLV 从数据包时间戳恢复时长；仍无法确认完整性时保留源文件。
-后处理在后台串行运行，待处理场次存在时暂停自动清理，避免删除仍在处理的录制文件。
-场次及配置快照保存在 `recordings/.sessions/`，录制开始前登记分段；重启后恢复同场录制，
-已下播的任务继续后处理，失败每五分钟重试。最终文件校验通过后才清理源分段。
-最终文件统一命名为 `YYYYMMDD_HHMMSS_直播标题.mp4`，保留整场开始时间。
-`_part001`、`.merged`、`.transcoded` 只用于处理中间文件，不出现在最终视频名里。
-没有场次清单的历史散落文件仍需人工核对，不能仅按标题猜测分组。
-
-### 自动上传夸克
-
-宿主机安装并授权夸克官方 `quarkclouddrive` 后，设置 `[Upload]`：
-`Enabled = true`、`QuarkCli` 和 `Node` 的实际路径。`ParentFid` 填目标云端目录的 FID；
-未启用镜像同步时也可留空，使用官方工具默认目录。
-安装用户定时器（项目位于 `/path/to/bili-recorder`；其他位置请调整 service）：
-所附 service 使用 本地私有环境文件 声明 CLI 渠道，须与官方 CLI 已授权的渠道一致。
+每五分钟上传一次可使用 `scripts/quark-upload.service` 与 `.timer`：先把 service 的 `/path/to/bili-recorder` 替换为自己的路径，确认 `.venv` 已安装，再安装至 `~/.config/systemd/user/`。需要渠道环境变量时放在本地 `config/upload.env`。
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp scripts/quark-upload.service scripts/quark-upload.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now quark-upload.timer
+journalctl --user -u quark-upload.service
 ```
 
-每五分钟检查一次顶层最终 MP4；场次清单中的原流、`_partNNN` 分段及处理临时文件不上传。
-转码校验后原子发布完整文件。上传成功确认文件大小并记录 SHA256；已上传文件跳过，
-失败任务使用官方断点续传重试；进程中断后找回 CLI 任务，已完成任务核对云端后补记成功。
-保留本地文件，未上传的最终文件不会被自动清理。CLI 的配置及任务记录须保留在其运行时目录。
-上传状态在 `recordings/.quark-upload/manifest.json`，日志用
-`journalctl --user -u quark-upload.service` 查看。已整理的旧 MP4 可显式加入队列，保留相对路径记录：
+升级旧部署前先确认没有录制或转码任务，再替换容器与宿主机定时器入口。历史顶层录像不会被新房间目录自动扫描；保留原配置可继续以旧单房间布局运行上传，迁移历史文件应单独核对，不直接删除。
+
+## 项目结构与验证
+
+```text
+src/bili_recorder/
+  cli.py             命令入口与按房间控制
+  config.py          本地配置与房间参数
+  supervisor.py      进程监督、启停与锁
+  recorder.py        开播检测、录制与场次调度
+  media.py           合并、转码和媒体校验
+  session_store.py   场次持久化与恢复
+  quark_upload.py    上传、续传和归档回执
+  cloud_sync.py      云端独立校验与显式镜像
+  naming.py          文件命名
+  processes.py       FFmpeg 中断与收尾
+  locking.py         进程互斥
+config/example.ini   公共配置模板
+config/local.ini     本地个人配置（忽略）
+tests/               媒体、并发进程和上传失败路径测试
+scripts/             Docker 启动与 systemd 模板
+docs/                架构与实施记录
+recordings/          录像与场次状态（忽略）
+.runtime/            进程状态、共享转码锁（忽略）
+```
 
 ```bash
-python3 -B quark_upload.py --enqueue recordings/某场直播
-systemctl --user start quark-upload.service
+uv run python -B -m unittest discover -s tests -v
+docker compose config --quiet
+bash -n scripts/up.sh
 ```
 
-自动清理只处理顶层已完成且已上传的 MP4；原始分段、临时文件和场次子目录不参与保留期清理。
+测试使用本地 HTTP 流、真实 FFmpeg、独立录制进程及外部云服务替身；不写入真实网盘。并发与归档场景的结果清单保存在 `.runtime/test-results/`。新环境需自行安装 FFmpeg；NVENC 能否工作取决于 GPU、驱动和 FFmpeg 构建。
 
-需要与本地镜像同步时，挂载 AList 的夸克驱动，并建立基本路径限定为目标目录的专用账号。
-将 `url`、`username`、`password` 存入权限为 `600` 的私有 JSON，在 `[Upload]` 的
-`AlistCredentials` 中填其绝对路径；账号需要列举、刷新、改名和删除权限。
-`ParentFid` 必须指向同一目录，例如 `夸克网盘/Recordings`。
-上传继续使用官方 CLI 的断点续传，改名和删除通过 AList 完成。
-本地改名按已记录的 SHA256 复用云端文件；内容变更先保留旧云端版本，再上传新版本。
-只有全部本地最终 MP4 均在云端确认、且本地文件集合和大小未变，才删除该目录多余的 MP4。
-云端操作失败会保留本地文件和待重试任务；下一轮再次同步。云端单独删除的文件会从本地补回。
-同步仅覆盖最终视频，隐藏运行状态、临时文件和本地整理说明不上传。
-AList 将夸克登录凭据保存在自己的数据库中；服务重启不必重新扫码，服务端使凭据失效后仍需重新授权。
-
-### `[Maintenance]`
-
-- `CleanupEnabled`: 是否启用清理
-- `KeepDays`: 保留天数
-- `KeepCount`: 保留文件数
-- `CleanupExtensions`: 参与清理的扩展名
-
-## Common Commands
-
-```bash
-# 启动或更新
-./scripts/up.sh
-
-# 查看容器状态
-./scripts/up.sh ps
-
-# 实时日志
-docker compose logs -f bili-recorder
-
-# 查看健康检查
-docker inspect --format='{{json .State.Health}}' bili-recorder
-```
-
-运行中切换直播间：
-
-```bash
-sed -i 's/^RoomId = .*/RoomId = 123456/' config.ini
-```
-## License
-
-MIT
+MIT License。

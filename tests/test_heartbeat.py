@@ -7,12 +7,12 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import recorder
+from bili_recorder import recorder, media
 
 
 class HeartbeatTest(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_during_recording_merge_and_transcode(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config["General"]["RoomId"] = "123456"
         loop_thread = threading.get_ident()
         real_sleep = asyncio.sleep
@@ -70,8 +70,8 @@ class HeartbeatTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(recorder, "get_live_url_with_retry", AsyncMock(return_value=("test", ""))), \
                  patch.object(recorder, "cleanup_recordings_if_needed"), \
                  patch.object(recorder, "record_stream", record), \
-                 patch.object(recorder, "merge_recording_parts_if_needed", merge), \
-                 patch.object(recorder, "transcode_after_recording_if_enabled", transcode), \
+                 patch.object(media, "merge_recording_parts_if_needed", merge), \
+                 patch.object(media, "transcode_after_recording_if_enabled", transcode), \
                  patch.object(recorder.asyncio, "sleep", fast_sleep):
                 existing_tasks = asyncio.all_tasks()
                 try:

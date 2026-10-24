@@ -1,12 +1,12 @@
 [Unit]
-Description=Sync finalized Bili recordings to Quark
+Description=Archive finalized Bili recordings to Quark
 
 [Service]
 Type=oneshot
+# Replace these paths with your checkout and virtual environment.
 WorkingDirectory=/path/to/bili-recorder
-# Preserve the authorized CLI channel for the official CLI outside an agent shell.
 EnvironmentFile=-/path/to/bili-recorder/config/upload.env
-ExecStart=/usr/bin/python3 -B /path/to/bili-recorder/quark_upload.py
+ExecStart=/path/to/bili-recorder/.venv/bin/bili-recorder --config /path/to/bili-recorder/config/local.ini upload
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

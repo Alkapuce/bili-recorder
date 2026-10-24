@@ -3,7 +3,6 @@ import json
 import asyncio
 import subprocess
 import time
-import configparser
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +11,14 @@ from bilibili_api.exceptions import ResponseCodeException
 import traceback
 import logging
 import glob
-import tempfile
 import httpx
-import math
-from session_store import SessionStore
+from contextlib import nullcontext
+from .session_store import SessionStore
+from .config import get_config_path, read_config, room_config
+from .locking import exclusive
+from .processes import STOP_EVENT, stop_process
+from .naming import get_timestamp, build_output_file_path, build_merged_file_path
+from .media import process_recording_session
 
 # 配置日志
 logging.basicConfig(
@@ -30,29 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bilibili_api").setLevel(logging.WARNING)
 
 STATUS_FILE = "status.json"
-CONFIG_ENV_VAR = "BILI_CONFIG_PATH"
-DEFAULT_CONFIG_PATH = "config.ini"
-_NVENC_PROBE_CACHE = {}
 
-
-def get_config_path():
-    return os.environ.get(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH)
-
-
-def read_config(config_path=None):
-    config = configparser.ConfigParser()
-    target_path = config_path or get_config_path()
-    loaded_files = config.read(target_path, encoding='utf-8')
-    if not loaded_files:
-        raise FileNotFoundError(
-            f"配置文件不存在: {target_path}。请先复制 config.example.ini 为 config.ini，"
-            f"或通过环境变量 {CONFIG_ENV_VAR} 指定配置文件路径。"
-        )
-    return config
-
-
-def get_timestamp():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def write_status_atomic(status_info):
@@ -68,6 +49,8 @@ def update_status(room_id, is_live=False, is_recording=False, room_title="N/A", 
         "updated_at": get_timestamp(),
         "heartbeat_ts": time.time(),
         "room_id": room_id,
+        "pid": os.getpid(),
+        "stopped": False,
         "is_live": is_live,
         "is_recording": is_recording,
         "room_title": room_title if is_live else "N/A",
@@ -93,12 +76,6 @@ async def refresh_heartbeat_periodically():
         except Exception as e:
             logger.warning(f"刷新心跳失败: {e}")
 
-
-def sanitize_title(title):
-    """保留中文，过滤非法文件名字符。"""
-    illegal_chars = '<>:"/\\|?*\n\r\t'
-    cleaned = ''.join(c for c in title if c not in illegal_chars).strip()
-    return cleaned or "untitled"
 
 
 def get_free_space_gb(path):
@@ -135,8 +112,9 @@ def get_dynamic_room_id(config, current_room_id):
 
 
 def validate_startup_config(config):
-    if 'General' not in config:
-        raise ValueError("配置文件缺少 [General] 段")
+    for section in ('General', 'Recording', 'PostProcess', 'Maintenance'):
+        if section not in config:
+            raise ValueError(f"配置文件缺少 [{section}] 段")
 
     room_id_raw = config['General'].get('RoomId', '').strip()
     try:
@@ -150,6 +128,14 @@ def validate_startup_config(config):
     save_dir = config['General'].get('SaveDir', '').strip()
     if not save_dir:
         raise ValueError("SaveDir 不能为空")
+    if config['General'].getint('CheckInterval', fallback=60) <= 0:
+        raise ValueError("CheckInterval 必须大于 0")
+    if config['Recording'].get('Format', 'flv') not in {'flv', 'mp4', 'mkv'}:
+        raise ValueError("Recording Format 只支持 flv、mp4、mkv")
+    if config['PostProcess'].getint('CpuThreads', fallback=2) <= 0:
+        raise ValueError("CpuThreads 必须大于 0")
+    if config.getboolean('Upload', 'Enabled', fallback=False) and config['PostProcess'].get('OutputFormat', 'mp4') != 'mp4':
+        raise ValueError("自动上传目前只支持最终 MP4，请设置 PostProcess OutputFormat=mp4")
 
     return room_id
 
@@ -341,22 +327,6 @@ async def check_live_status_with_retry(room_id, max_retries=3):
     return False, "", to_error_reason(last_exc or Exception("unknown"), "check_live_status")
 
 
-def build_output_file_path(config, title, session_tag=None, part_index=1):
-    save_dir = config['General']['SaveDir']
-    os.makedirs(save_dir, exist_ok=True)
-
-    timestamp = session_tag or get_timestamp()
-    safe_title = sanitize_title(title)
-    part_suffix = f"_part{part_index:03d}"
-    filename = f"{timestamp}_{safe_title}{part_suffix}.{config['Recording']['Format']}"
-    return os.path.join(save_dir, filename)
-
-
-def build_merged_file_path(config, session_tag, session_title):
-    save_dir = config['General']['SaveDir']
-    ext = config['Recording']['Format']
-    safe_title = sanitize_title(session_title)
-    return os.path.join(save_dir, f"{session_tag}_{safe_title}.merged.{ext}")
 
 
 def record_stream(url, title, config, file_path=None):
@@ -403,6 +373,9 @@ def record_stream(url, title, config, file_path=None):
         last_change_ts = start_ts
 
         while True:
+            if STOP_EVENT.is_set():
+                stop_process(process)
+                return False, "stopped", file_path
             ret = process.poll()
             if ret is not None:
                 if ret == 0:
@@ -438,510 +411,14 @@ def record_stream(url, title, config, file_path=None):
             except Exception as e:
                 logger.warning(f"检查录制文件大小失败: {e}")
 
-            time.sleep(max(1, poll_interval))
+            STOP_EVENT.wait(max(1, poll_interval))
 
     except Exception as e:
         logger.error(f"录制进程异常: {e}\n{traceback.format_exc()}")
         return False, "record_exception", file_path
 
 
-def ffprobe_has_video(path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=nk=1:nw=1",
-        path
-    ]
-    ret = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return ret.returncode == 0 and bool(ret.stdout.strip())
-
-
-def ffprobe_duration_ok(path, min_seconds=1.0):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=nk=1:nw=1",
-        path
-    ]
-    ret = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if ret.returncode != 0:
-        return False
-    try:
-        duration = float(ret.stdout.strip())
-        return duration >= min_seconds
-    except Exception:
-        return False
-
-
-def ffprobe_media_info(path):
-    ret = subprocess.run([
-        "ffprobe", "-v", "error", "-show_entries",
-        "format=duration:stream=codec_type,codec_name,sample_rate,channels",
-        "-of", "json", path
-    ], capture_output=True, text=True, check=False)
-    if ret.returncode != 0:
-        raise ValueError(f"无法读取媒体信息: {path}")
-    data = json.loads(ret.stdout)
-    duration = float(data.get("format", {}).get("duration", 0))
-    if not math.isfinite(duration) or duration <= 0:
-        # Interrupted FLVs often have no duration header; recover it from packet timestamps.
-        packets = subprocess.run([
-            "ffprobe", "-v", "error", "-show_entries", "packet=pts_time,duration_time",
-            "-of", "csv=p=0", path
-        ], capture_output=True, text=True, check=True)
-        starts, ends = [], []
-        for line in packets.stdout.splitlines():
-            fields = line.split(",")
-            try:
-                start = float(fields[0])
-                length = float(fields[1]) if len(fields) > 1 and fields[1] != "N/A" else 0
-            except ValueError:
-                continue
-            if math.isfinite(start) and math.isfinite(length):
-                starts.append(start)
-                ends.append(start + length)
-        duration = max(ends) - min(starts) if starts else 0
-    audio = [
-        (s.get("codec_name"), s.get("sample_rate"), s.get("channels"))
-        for s in data.get("streams", []) if s.get("codec_type") == "audio"
-    ]
-    return duration, audio
-
-
-def ffprobe_video_info(path):
-    result = subprocess.run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "stream=codec_name,width,height,pix_fmt,r_frame_rate", "-of", "json", path
-    ], capture_output=True, text=True, check=True)
-    return json.loads(result.stdout)["streams"][0]
-
-
-def validate_transcoded_file(path, min_seconds=1.0, source_files=None):
-    if not os.path.exists(path):
-        return False, "output_missing"
-    if os.path.getsize(path) <= 0:
-        return False, "output_zero_size"
-    if not ffprobe_has_video(path):
-        return False, "output_no_video_stream"
-    if not ffprobe_duration_ok(path, min_seconds=min_seconds):
-        return False, "output_duration_too_short"
-    if source_files:
-        try:
-            duration, audio = ffprobe_media_info(path)
-            sources = [ffprobe_media_info(p) for p in source_files]
-            if any(not math.isfinite(seconds) or seconds <= 0 for seconds, _ in sources):
-                return False, "source_duration_unknown"
-            expected = sum(seconds for seconds, _ in sources)
-            if abs(duration - expected) > max(2, expected * 0.001):
-                return False, "output_duration_mismatch"
-            if any(audio != source_audio for _, source_audio in sources):
-                return False, "output_audio_mismatch"
-        except (ValueError, OSError) as e:
-            logger.warning(f"媒体完整性校验失败: {e}")
-            return False, "media_probe_failed"
-    return True, "ok"
-
-
-def ffmpeg_supports_encoder(encoder):
-    cmd = ["ffmpeg", "-hide_banner", "-encoders"]
-    ret = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return ret.returncode == 0 and encoder in ret.stdout
-
-
-def probe_ffmpeg_encoder_usable(encoder):
-    cached = _NVENC_PROBE_CACHE.get(encoder)
-    if cached is not None:
-        return cached
-
-    if not ffmpeg_supports_encoder(encoder):
-        result = (False, "encoder_not_built")
-        _NVENC_PROBE_CACHE[encoder] = result
-        return result
-
-    fd, probe_path = tempfile.mkstemp(prefix=f"{encoder}_probe_", suffix=".mkv")
-    os.close(fd)
-    try:
-        probe_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=1:duration=1",
-            "-frames:v", "1",
-            "-an",
-            "-c:v", encoder
-        ]
-
-        if "nvenc" in encoder:
-            probe_cmd.extend(["-preset", "p4", "-rc", "vbr", "-cq", "30", "-b:v", "0"])
-
-        probe_cmd.append(probe_path)
-
-        ret = subprocess.run(probe_cmd, capture_output=True, text=True, check=False)
-        wrote_output = os.path.exists(probe_path) and os.path.getsize(probe_path) > 0
-        if ret.returncode == 0 and wrote_output:
-            result = (True, "ok")
-        else:
-            stderr = (ret.stderr or "").strip().splitlines()
-            reason = "output_missing" if not wrote_output else f"ffmpeg_exit_{ret.returncode}"
-            for line in stderr:
-                lowered = line.lower()
-                if any(key in lowered for key in ["unsupported device", "no capable devices found", "cannot load libcuda", "error while opening encoder"]):
-                    reason = line
-                    break
-            else:
-                if stderr:
-                    reason = stderr[-1]
-            result = (False, reason)
-    finally:
-        try:
-            if os.path.exists(probe_path):
-                os.remove(probe_path)
-        except Exception:
-            pass
-
-    _NVENC_PROBE_CACHE[encoder] = result
-    return result
-
-
-def unique_transcode_attempts(attempts):
-    seen = set()
-    result = []
-    for encoder, quality, preset in attempts:
-        key = (encoder, quality, preset)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append((encoder, quality, preset))
-    return result
-
-
-def resolve_transcode_attempts(config):
-    auto_prefer_nvenc = config['PostProcess'].get('AutoPreferNvenc', 'true').lower() == 'true'
-
-    nvenc_primary = config['PostProcess'].get('NvencVideoEncoder', 'av1_nvenc')
-    nvenc_primary_quality = config['PostProcess'].get('NvencQuality', '34')
-    nvenc_primary_preset = config['PostProcess'].get('NvencPreset', 'p5')
-    nvenc_fallback = config['PostProcess'].get('NvencFallbackVideoEncoder', '')
-    nvenc_fallback_quality = config['PostProcess'].get('NvencFallbackQuality', '23')
-    nvenc_fallback_preset = config['PostProcess'].get('NvencFallbackPreset', 'p4')
-
-    cpu_primary = config['PostProcess'].get('VideoEncoder', 'libsvtav1')
-    cpu_primary_quality = config['PostProcess'].get('VideoQuality', '34')
-    cpu_primary_preset = config['PostProcess'].get('Preset', '6')
-    cpu_fallback = config['PostProcess'].get('FallbackVideoEncoder', '')
-    cpu_fallback_quality = config['PostProcess'].get('FallbackVideoQuality', '23')
-    cpu_fallback_preset = config['PostProcess'].get('FallbackPreset', 'medium')
-
-    attempts = []
-
-    if auto_prefer_nvenc:
-        for encoder, quality, preset in [
-            (nvenc_primary, nvenc_primary_quality, nvenc_primary_preset),
-            (nvenc_fallback, nvenc_fallback_quality, nvenc_fallback_preset),
-        ]:
-            if not encoder:
-                continue
-            usable, reason = probe_ffmpeg_encoder_usable(encoder)
-            if usable:
-                attempts.append((encoder, quality, preset))
-            else:
-                logger.info(f"NVENC 编码器不可用，跳过 {encoder}: {reason}")
-
-    attempts.extend([
-        (cpu_primary, cpu_primary_quality, cpu_primary_preset),
-        (cpu_fallback, cpu_fallback_quality, cpu_fallback_preset),
-    ])
-    return unique_transcode_attempts([a for a in attempts if a[0]])
-
-
-def build_transcode_cmd(record_file, out_file, encoder, quality, preset, cpu_threads):
-    base = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-        "-fflags", "+discardcorrupt",
-        "-err_detect", "ignore_err",
-        "-i", record_file,
-        "-map", "0:v:0", "-map", "0:a?"
-    ]
-    if out_file.endswith(".mp4"):
-        base.extend(["-movflags", "+faststart"])
-
-    if encoder == "libsvtav1":
-        return base + [
-            "-c:v", encoder, "-preset", preset, "-crf", quality, "-g", "60",
-            "-pix_fmt", "yuv420p10le", "-svtav1-params", f"lp={cpu_threads}",
-            "-c:a", "copy", out_file
-        ]
-
-    if "libx265" in encoder:
-        x265_params = f"pools=1:frame-threads={max(1, min(2, cpu_threads))}"
-        return base + [
-            "-threads", str(cpu_threads),
-            "-c:v", "libx265",
-            "-preset", preset,
-            "-crf", quality,
-            "-x265-params", x265_params,
-            "-c:a", "copy",
-            out_file
-        ]
-
-    if "libx264" in encoder:
-        return base + [
-            "-threads", str(cpu_threads),
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", quality,
-            "-c:a", "copy",
-            out_file
-        ]
-
-    if encoder in {"hevc_nvenc", "h264_nvenc", "av1_nvenc"}:
-        return base + [
-            "-c:v", encoder,
-            "-g", "60",
-            "-preset", preset,
-            "-rc", "vbr",
-            "-cq", quality,
-            "-b:v", "0",
-            "-c:a", "copy",
-            out_file
-        ]
-
-    return base + [
-        "-c:v", encoder,
-        "-c:a", "copy",
-        out_file
-    ]
-
-
-def run_low_priority_command(cmd, nice_level=10, use_nice=True, use_ionice=True):
-    """低优先级运行命令，减少对同机其他业务影响。"""
-    final_cmd = cmd
-    if use_ionice and shutil.which("ionice"):
-        final_cmd = ["ionice", "-c2", "-n7"] + final_cmd
-
-    if use_nice and shutil.which("nice"):
-        final_cmd = ["nice", "-n", str(max(0, min(19, int(nice_level))))] + final_cmd
-
-    return subprocess.run(final_cmd, check=False).returncode
-
-
-def merge_recording_parts_if_needed(parts, config, session_tag, session_title):
-    """默认先合并分段，再转码。"""
-    valid_parts = [p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0]
-    if not valid_parts:
-        return None, "no_valid_parts"
-    if len(valid_parts) != len(parts):
-        return None, "missing_recording_parts"
-
-    if len(valid_parts) == 1:
-        return valid_parts[0], "single_part"
-
-    video = [ffprobe_video_info(p) for p in valid_parts]
-    if any(info != video[0] for info in video[1:]):
-        return None, "incompatible_video_streams"
-
-    merged_file = build_merged_file_path(config, session_tag, session_title)
-    list_file = f"{merged_file}.concat.txt"
-
-    try:
-        with open(list_file, "w", encoding="utf-8") as f:
-            for p in valid_parts:
-                escaped = os.path.abspath(p).replace("'", "'\\''")
-                f.write(f"file '{escaped}'\n")
-                seconds, _ = ffprobe_media_info(p)
-                if seconds <= 0 or not math.isfinite(seconds):
-                    return None, "source_duration_unknown"
-                f.write(f"duration {seconds:.9f}\n")
-
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            "-f", "concat", "-safe", "0", "-i", list_file,
-            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-        ]
-        if merged_file.endswith('.mp4'):
-            cmd.extend(["-movflags", "+faststart"])
-        cmd.append(merged_file)
-        ret = subprocess.run(cmd, check=False).returncode
-        if ret != 0:
-            return None, f"merge_failed_exit_{ret}"
-
-        valid, reason = validate_transcoded_file(merged_file, source_files=valid_parts)
-        if not valid:
-            return None, f"merge_invalid_{reason}"
-
-        return merged_file, "merged"
-    except Exception as e:
-        logger.error(f"分段合并异常: {e}\n{traceback.format_exc()}")
-        return None, "merge_exception"
-    finally:
-        try:
-            if os.path.exists(list_file):
-                os.remove(list_file)
-        except Exception:
-            pass
-
-
-def transcode_after_recording_if_enabled(record_file, config):
-    """录后离线转码：优先 NVENC，探测失败时自动回退 CPU。"""
-    enabled = config['PostProcess'].get('TranscodeEnabled', 'true').lower() == 'true'
-    if not enabled:
-        return True, "disabled"
-
-    if not os.path.exists(record_file):
-        logger.warning(f"录后转码跳过：源文件不存在 {record_file}")
-        return False, "source_missing"
-
-    out_ext = config['PostProcess'].get('OutputFormat', 'mkv')
-    keep_source = config['PostProcess'].get('KeepSource', 'false').lower() == 'true'
-    min_probe_seconds = float(config['PostProcess'].get('MinValidDurationSeconds', '3'))
-
-    cpu_threads = int(config['PostProcess'].get('CpuThreads', '2'))
-    use_nice = config['PostProcess'].get('UseNice', 'true').lower() == 'true'
-    nice_level = int(config['PostProcess'].get('NiceLevel', '10'))
-    use_ionice = config['PostProcess'].get('UseIonice', 'true').lower() == 'true'
-
-    attempts = resolve_transcode_attempts(config)
-
-    base, _ = os.path.splitext(record_file)
-    out_file = f"{base}.transcoded.{out_ext}"
-    partial_file = f"{base}.transcoded.partial.{out_ext}"
-
-    if os.path.exists(out_file):
-        valid, reason = validate_transcoded_file(out_file, min_seconds=min_probe_seconds,
-                                                source_files=[record_file])
-        if valid:
-            return True, "already_transcoded"
-        logger.error(f"已有最终文件校验失败，保留现场: {out_file}, {reason}")
-        return False, "existing_output_invalid"
-
-    for idx, (encoder, quality, preset) in enumerate(attempts, start=1):
-        logger.info(
-            f"开始录后转码(尝试 {idx}/{len(attempts)}): {os.path.basename(record_file)} -> {os.path.basename(out_file)} | "
-            f"encoder={encoder}, threads={cpu_threads}, nice={use_nice}, ionice={use_ionice}"
-        )
-        cmd = build_transcode_cmd(record_file, partial_file, encoder, quality, preset, cpu_threads)
-
-        try:
-            ret = run_low_priority_command(cmd, nice_level=nice_level, use_nice=use_nice, use_ionice=use_ionice)
-            if ret != 0:
-                logger.error(f"录后转码失败，返回码 {ret}，encoder={encoder}")
-                if os.path.exists(partial_file):
-                    try:
-                        os.remove(partial_file)
-                    except Exception:
-                        pass
-                continue
-
-            valid, reason = validate_transcoded_file(
-                partial_file, min_seconds=min_probe_seconds, source_files=[record_file]
-            )
-            if not valid:
-                logger.error(f"录后转码产物校验失败: reason={reason} encoder={encoder}")
-                if os.path.exists(partial_file):
-                    try:
-                        os.remove(partial_file)
-                    except Exception:
-                        pass
-                continue
-
-            os.replace(partial_file, out_file)
-            src_size = os.path.getsize(record_file) if os.path.exists(record_file) else 0
-            out_size = os.path.getsize(out_file) if os.path.exists(out_file) else 0
-            ratio = (1 - out_size / src_size) * 100 if src_size > 0 else 0
-            logger.info(f"录后转码完成并校验通过: encoder={encoder}, 节省 {ratio:.2f}% 空间")
-
-            if not keep_source and os.path.exists(record_file):
-                os.remove(record_file)
-                logger.info(f"转码产物有效，已删除源文件: {record_file}")
-
-            return True, f"ok_{encoder}"
-
-        except Exception as e:
-            logger.error(f"录后转码异常: {e}\n{traceback.format_exc()}")
-
-    logger.error("录后转码所有尝试均失败，已保留源文件")
-    return False, "all_transcode_attempts_failed"
-
-
-async def process_recording_session(parts, config, session_tag, session_title):
-    """串行处理已下播的场次，不阻塞下一场的录制。"""
-    try:
-        extension = config['PostProcess'].get('OutputFormat', 'mp4')
-        final = os.path.join(config['General']['SaveDir'],
-                             f"{session_tag}_{sanitize_title(session_title)}.{extension}")
-        enabled = config['PostProcess'].getboolean('TranscodeEnabled', fallback=True)
-        if enabled and os.path.exists(final):
-            if Path(final).resolve() in {Path(part).resolve() for part in parts}:
-                logger.error(f"最终文件名与原流冲突，保留源文件: {final}")
-                return False
-            return await asyncio.to_thread(lambda: validate_transcoded_file(final, source_files=parts)[0])
-        source, reason = await asyncio.to_thread(
-            merge_recording_parts_if_needed, parts, config, session_tag, session_title
-        )
-        if reason == "incompatible_video_streams":
-            ok = await asyncio.to_thread(transcode_mixed_session, parts, config, session_tag, session_title)
-            output = os.path.splitext(build_merged_file_path(config, session_tag, session_title))[0] + '.transcoded.mp4'
-        elif source:
-            ok, reason = await asyncio.to_thread(transcode_after_recording_if_enabled, source, config)
-            output = f"{os.path.splitext(source)[0]}.transcoded.{extension}"
-        else:
-            ok = False
-        if ok:
-            if enabled:
-                os.replace(output, final)
-            return True
-        logger.error(f"录制会话后处理失败，保留源文件: {session_tag}, {reason}")
-    except Exception:
-        logger.exception(f"录制会话后处理异常，保留源文件: {session_tag}")
-    return False
-
-
-def transcode_mixed_session(parts, config, tag, title):
-    """Normalize changed video formats to AV1 before concat; never re-encode audio."""
-    if not config['PostProcess'].getboolean('TranscodeEnabled', fallback=True):
-        return False
-    output = os.path.splitext(build_merged_file_path(config, tag, title))[0] + '.transcoded.mp4'
-    if os.path.exists(output):
-        return validate_transcoded_file(output, source_files=parts)[0]
-    media = [ffprobe_media_info(p) for p in parts]
-    if any(audio != media[0][1] for _, audio in media[1:]):
-        logger.error("同场音轨格式发生变化，保留全部分段，避免损失音质")
-        return False
-    video = [ffprobe_video_info(p) for p in parts]
-    width = min(v['width'] for v in video) // 2 * 2
-    height = min(v['height'] for v in video) // 2 * 2
-    work = os.path.join(config['General']['SaveDir'], '.sessions', f'{tag}.work')
-    if os.path.islink(work):
-        raise ValueError(f"后处理临时目录不能是符号链接: {work}")
-    os.makedirs(work, exist_ok=True)
-    normalized = [os.path.join(work, f'part{n:03d}.mp4') for n in range(len(parts))]
-    options = config['PostProcess']
-    for encoder, quality, preset in resolve_transcode_attempts(config):
-        for source, target in zip(parts, normalized):
-            command = build_transcode_cmd(source, target, encoder, quality, preset,
-                                          options.getint('CpuThreads', 2))
-            command[-1:-1] = ['-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30']
-            result = run_low_priority_command(command, nice_level=options.getint('NiceLevel', 10),
-                                             use_nice=options.getboolean('UseNice', True),
-                                             use_ionice=options.getboolean('UseIonice', True))
-            if result != 0 or not validate_transcoded_file(target, source_files=[source])[0]:
-                break
-        else:
-            merge_config = configparser.ConfigParser()
-            merge_config.read_dict({section: dict(config[section]) for section in config.sections()})
-            merge_config['General']['SaveDir'] = work
-            merge_config['Recording']['Format'] = 'mp4'
-            merged, reason = merge_recording_parts_if_needed(normalized, merge_config, tag, title)
-            if merged and validate_transcoded_file(merged, source_files=parts)[0]:
-                os.replace(merged, output)
-                shutil.rmtree(work)
-                logger.info(f"同场不同视频格式已统一为 AV1 并合并: {output}")
-                return True
-            logger.error(f"AV1 分段合并失败: {reason}")
-    return False
-
-
-async def process_pending_sessions(store, wake):
+async def process_pending_sessions(store, wake, lock_path=None):
     """Retry durable jobs serially; sources survive until the final output is published."""
     while True:
         wake.clear()
@@ -952,20 +429,21 @@ async def process_pending_sessions(store, wake):
             keep_source = config["PostProcess"].getboolean("KeepSource", fallback=False)
             config["PostProcess"]["KeepSource"] = "true"
             try:
-                if session["state"] != "complete":
-                    if session["parts"] and not await process_recording_session(
-                            session["parts"], config, session["tag"], session["title"]):
-                        session["retry_at"] = time.time() + 300
+                with exclusive(lock_path) if lock_path else nullcontext():
+                    if session["state"] != "complete":
+                        if session["parts"] and not await process_recording_session(
+                                session["parts"], config, session["tag"], session["title"]):
+                            session["retry_at"] = time.time() + 300
+                            store.save(session)
+                            continue
+                        session["state"] = "complete"
                         store.save(session)
-                        continue
-                    session["state"] = "complete"
-                    store.save(session)
-                if not keep_source and config["PostProcess"].getboolean("TranscodeEnabled", fallback=True):
-                    sources = session["parts"] + [build_merged_file_path(config, session["tag"], session["title"])]
-                    for source in sources:
-                        if os.path.exists(source):
-                            os.remove(source)
-                store.remove(session)
+                    if not keep_source:
+                        sources = session["parts"] + [build_merged_file_path(config, session["tag"], session["title"])]
+                        for source in sources:
+                            if os.path.exists(source):
+                                os.remove(source)
+                    store.remove(session)
             except Exception:
                 logger.exception(f"场次后处理未完成，下轮重试: {session['tag']}")
                 session["retry_at"] = time.time() + 300
@@ -978,6 +456,8 @@ async def process_pending_sessions(store, wake):
 
 def cleanup_recordings_if_needed(config):
     """按保留天数/数量清理旧录制文件，减少长期运行占满磁盘风险。"""
+    if config.getboolean("Upload", "DeleteLocal", fallback=False):
+        return  # Archival verification owns deletion in this mode.
     enabled = config['Maintenance'].get('CleanupEnabled', 'true').lower() == 'true'
     if not enabled:
         return
@@ -994,7 +474,7 @@ def cleanup_recordings_if_needed(config):
     upload_ledger = {}
     upload_enabled = config.getboolean('Upload', 'Enabled', fallback=False)
     if upload_enabled:
-        from quark_upload import upload_pending
+        from .quark_upload import upload_pending
         ledger_path = os.path.join(save_dir, '.quark-upload', 'manifest.json')
         try:
             if os.path.exists(ledger_path):
@@ -1009,7 +489,7 @@ def cleanup_recordings_if_needed(config):
         files.extend(glob.glob(os.path.join(save_dir, f"*.{ext}")) )
 
     # Raw parts and partial outputs are recovery inputs, never retention-cleanup candidates.
-    from cloud_sync import completed_files
+    from .cloud_sync import completed_files
     completed = completed_files(Path(save_dir))
     files = [f for f in files if Path(f) in completed]
     if upload_enabled:
@@ -1051,11 +531,13 @@ def cleanup_recordings_if_needed(config):
         logger.info(f"本轮录制文件清理完成，共删除 {deleted_count} 个文件")
 
 
-async def main():
+async def main(config_path=None, room_id_override=None):
     logger.info("=== BiliLive Recorder (Linux Server Edition - Stable) ===")
 
-    config_path = get_config_path()
+    config_path = config_path or get_config_path()
     config = read_config(config_path)
+    if room_id_override is not None:
+        config = room_config(config, room_id_override)
     room_id = validate_startup_config(config)
     interval = int(config['General']['CheckInterval'])
 
@@ -1070,7 +552,7 @@ async def main():
     max_352_backoff = 600      # 熔断最大等待秒数 (10分钟)
     store = SessionStore(config['General']['SaveDir'])
     wake = asyncio.Event()
-    pending_task = asyncio.create_task(process_pending_sessions(store, wake))
+    pending_task = asyncio.create_task(process_pending_sessions(store, wake, config["PostProcess"].get("LockFile")))
     session_tag = None
     active_session = None
     for session in store.load():
@@ -1088,9 +570,15 @@ async def main():
         logger.info(f"恢复未结束场次: {session_tag}, 已登记 {len(session['parts'])} 个分段")
     while True:
         # 每轮读取配置，支持运行中切房间/改参数
+        if heartbeat_task.done():
+            heartbeat_task.result()
         if pending_task.done():
             pending_task.result()
         config = read_config(config_path)
+        if room_id_override is not None:
+            config = room_config(config, room_id_override)
+        if Path(config['General']['SaveDir']).resolve() != store.directory.parent:
+            raise ValueError("运行中修改 SaveDir 需要重新启动房间进程；原场次已保留")
         new_room_id = get_dynamic_room_id(config, room_id)
         if new_room_id != room_id and session_tag is not None:
             store.finish(active_session)
@@ -1160,7 +648,7 @@ async def main():
             if session_tag is None:
                 if not store.load():
                     cleanup_recordings_if_needed(config)
-                session_tag = get_timestamp()
+                session_tag = f"{datetime.now():%Y%m%d_%H%M%S_%f}_{room_id}"
                 session_title = title
                 session_config = config
                 part_index = 1
@@ -1222,13 +710,3 @@ async def main():
             update_status(room_id, is_live=False, is_recording=False, room_title="N/A")
 
         await asyncio.sleep(min(interval, max(1, recover_delay)) if session_tag else interval)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("\n录制器已手动停止。")
-    except Exception as e:
-        logger.error(f"启动失败: {e}")
-        raise SystemExit(1)

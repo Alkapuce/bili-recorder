@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import quark_upload
-from cloud_sync import completed_files
+from bili_recorder import quark_upload
+from bili_recorder.cloud_sync import completed_files
 
 
 class UploadTest(unittest.TestCase):
@@ -42,7 +42,7 @@ class UploadTest(unittest.TestCase):
             folder = Path(tmp)
             config = folder / "config.ini"
             config.write_text(f"[General]\nSaveDir={tmp}\n[Upload]\nEnabled=true\n"
-                              "AlistCredentials=private.json\nParentFid=target\n")
+                              "AlistCredentials=private.json\nParentFid=target\nMode=mirror\nQuarkCli=unused\n")
             first = folder / "first.mp4"
             first.write_bytes(b"complete")
             (folder / "active_part001.mp4").write_bytes(b"recording")
@@ -91,7 +91,7 @@ class UploadTest(unittest.TestCase):
             (folder / "symlink.mp4").symlink_to(source)
             config = configparser.ConfigParser()
             config.read_dict({"General": {"SaveDir": tmp}})
-            from session_store import SessionStore
+            from bili_recorder.session_store import SessionStore
             store = SessionStore(tmp)
             session = store.create(config, 1, "test", "title")
             session["parts"] = [str(source)]
@@ -187,22 +187,19 @@ sys.exit(1 if failed else 0)
             folder = Path(tmp)
             path = folder / 'session.mp4'
             path.write_bytes(b'complete')
-            root = folder / 'root.jsonl'
-            root.write_text(json.dumps({'filename':'Uploads','category':0,'fid':'parent'}))
             files = folder / 'files.jsonl'
             files.write_text(json.dumps({'filename':path.name,'size':8,'fid':'cloud-file'}))
             record = {'status':'pending','size':8,'attempt_started_at':1}
             responses = [
                 {'type':'list','data':{'recordId':'task','fileName':path.name,'fileSize':8,'createdAt':2000,'state':'success'}},
-                {'type':'result','code':0,'data':{'file_path':str(root),'hasMore':False}},
                 {'type':'result','code':0,'data':{'file_path':str(files),'hasMore':False}},
             ]
             with patch.object(quark_upload.subprocess, 'run', side_effect=[
                     subprocess.CompletedProcess([], 0, json.dumps(response)) for response in responses]) as run:
-                quark_upload.recover_interrupted_upload(path, {'Node':'node','QuarkCli':'cli'}, record, 'session', folder)
+                quark_upload.recover_interrupted_upload(path, {'Node':'node','QuarkCli':'cli','ParentFid':'parent'}, record, 'session', folder)
             self.assertEqual(record['status'], 'uploaded')
             self.assertEqual(record['file_id'], 'cloud-file')
-            self.assertEqual([call.args[0][2] for call in run.call_args_list], ['upload','browse','browse'])
+            self.assertEqual([call.args[0][2] for call in run.call_args_list], ['upload','browse'])
 
 
 if __name__ == "__main__":

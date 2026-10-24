@@ -10,12 +10,12 @@ import struct
 import threading
 from unittest.mock import AsyncMock, patch
 
-import recorder
+from bili_recorder import recorder, media
 
 
 class SessionTest(unittest.IsolatedAsyncioTestCase):
     async def test_parts_survive_clean_exit_retry_limit_and_status_error(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config["General"]["RoomId"] = "123456"
         config["Recording"]["MaxRecoverRetries"] = "0"
         checks = 0
@@ -75,7 +75,7 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_restart_recovers_recording_and_next_part_number(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config["General"]["RoomId"] = "123456"
         config["Recording"]["MaxRecoverRetries"] = "0"
         real_sleep = asyncio.sleep
@@ -138,7 +138,7 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(recorder.SessionStore(tmp).load(), [])
 
     async def test_pending_job_survives_failure_and_worker_restart(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         with tempfile.TemporaryDirectory() as tmp:
             config["General"]["SaveDir"] = tmp
             store = recorder.SessionStore(tmp)
@@ -174,29 +174,34 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
 
 class PostprocessTest(unittest.TestCase):
     def test_final_name_collision_preserves_original_recording(self):
-        config = recorder.read_config('config.example.ini')
+        config = recorder.read_config('config/example.ini')
         with tempfile.TemporaryDirectory() as tmp:
             config['General']['SaveDir'] = tmp
             source = os.path.join(tmp, 'test_title.mp4')
             with open(source, 'wb') as stream:
                 stream.write(b'original recording')
-            self.assertFalse(asyncio.run(recorder.process_recording_session([source], config, 'test', 'title')))
+            self.assertFalse(asyncio.run(media.process_recording_session([source], config, 'test', 'title')))
             with open(source, 'rb') as stream:
                 self.assertEqual(stream.read(), b'original recording')
 
     def test_session_state_rejects_paths_outside_recordings(self):
-        config = recorder.read_config('config.example.ini')
+        config = recorder.read_config('config/example.ini')
         with tempfile.TemporaryDirectory() as tmp:
             config['General']['SaveDir'] = tmp
             store = recorder.SessionStore(tmp)
             session = store.create(config, 123456, 'test', 'title')
             session['parts'] = [os.path.join(tmp, '..', 'unrelated.flv')]
-            store.save(session)
+            with self.assertRaises(ValueError):
+                store.save(session)
+            # An externally modified state file must also fail closed on load.
+            session['version'] = 2
+            session['parts'] = ['../unrelated.flv']
+            (store.directory / 'test.json').write_text(json.dumps(session))
             with self.assertRaises(ValueError):
                 store.load()
 
     def test_real_http_recording_and_durable_postprocess_with_missing_flv_duration(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config['PostProcess']['AutoPreferNvenc'] = 'false'
         config['PostProcess']['Preset'] = '10'
         config['PostProcess']['MinValidDurationSeconds'] = '1'
@@ -237,7 +242,7 @@ class PostprocessTest(unittest.TestCase):
             data[duration_pos + 1:duration_pos + 9] = struct.pack('>d', 0)
             with open(recording, 'wb') as f:
                 f.write(data)
-            self.assertGreater(recorder.ffprobe_media_info(recording)[0], 1.9)
+            self.assertGreater(media.ffprobe_media_info(recording)[0], 1.9)
             store = recorder.SessionStore(tmp)
             session = store.create(config, 123456, 'test', 'title')
             session['parts'] = [recording]
@@ -255,12 +260,12 @@ class PostprocessTest(unittest.TestCase):
                     await asyncio.gather(worker, return_exceptions=True)
             asyncio.run(process())
             output = os.path.join(tmp, 'test_title.mp4')
-            self.assertEqual(recorder.ffprobe_video_info(output)['codec_name'], 'av1')
+            self.assertEqual(media.ffprobe_video_info(output)['codec_name'], 'av1')
             self.assertEqual(audio, audio_bytes(output))
             self.assertFalse(os.path.exists(recording))
 
     def test_real_mixed_video_normalized_to_one_av1_with_copied_audio(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config['PostProcess']['AutoPreferNvenc'] = 'false'
         config['PostProcess']['KeepSource'] = 'true'
         config['PostProcess']['Preset'] = '10'
@@ -274,18 +279,19 @@ class PostprocessTest(unittest.TestCase):
                     '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', part
                 ], check=True)
-            self.assertEqual(recorder.merge_recording_parts_if_needed(parts, config, 'test', 'mixed'),
+            self.assertEqual(media.merge_recording_parts_if_needed(parts, config, 'test', 'mixed'),
                              (None, 'incompatible_video_streams'))
-            self.assertTrue(asyncio.run(recorder.process_recording_session(parts, config, 'test', 'mixed')))
+            self.assertTrue(asyncio.run(media.process_recording_session(parts, config, 'test', 'mixed')))
             output = os.path.join(tmp, 'test_mixed.mp4')
-            self.assertEqual(recorder.ffprobe_video_info(output)['codec_name'], 'av1')
+            self.assertEqual(media.ffprobe_video_info(output)['codec_name'], 'av1')
             def audio_bytes(path):
                 return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', path, '-map', '0:a',
                                                 '-c', 'copy', '-f', 'data', '-'])
             self.assertEqual(audio_bytes(output), b''.join(audio_bytes(p) for p in parts))
             self.assertTrue(all(os.path.exists(p) for p in parts))
     def test_cleanup_keeps_pending_uploads(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
+        config["Maintenance"]["CleanupEnabled"] = "true"
         config["Upload"]["Enabled"] = "true"
         config["Maintenance"]["KeepDays"] = "1"
         config["Maintenance"]["KeepCount"] = "0"
@@ -308,7 +314,7 @@ class PostprocessTest(unittest.TestCase):
             self.assertFalse(os.path.exists(final))
 
     def test_real_merge_av1_and_audio_copy(self):
-        config = recorder.read_config("config.example.ini")
+        config = recorder.read_config("config/example.ini")
         config["PostProcess"]["AutoPreferNvenc"] = "false"
         config["PostProcess"]["KeepSource"] = "true"
         config["PostProcess"]["MinValidDurationSeconds"] = "1"
@@ -330,11 +336,11 @@ class PostprocessTest(unittest.TestCase):
             data[pos:pos+8] = struct.pack('>d', 0)
             with open(parts[0], 'wb') as f:
                 f.write(data)
-            merged, reason = recorder.merge_recording_parts_if_needed(parts, config, "test", "title")
+            merged, reason = media.merge_recording_parts_if_needed(parts, config, "test", "title")
             self.assertEqual(reason, "merged")
             self.assertTrue(all(os.path.exists(p) for p in parts))
-            self.assertEqual(recorder.resolve_transcode_attempts(config), [("libsvtav1", "34", "10")])
-            ok, reason = recorder.transcode_after_recording_if_enabled(merged, config)
+            self.assertEqual(media.resolve_transcode_attempts(config), [("libsvtav1", "34", "10")])
+            ok, reason = media.transcode_after_recording_if_enabled(merged, config)
             self.assertTrue(ok, reason)
             output = os.path.splitext(merged)[0] + ".transcoded.mp4"
             codec = subprocess.check_output([
@@ -349,11 +355,11 @@ class PostprocessTest(unittest.TestCase):
                 ])
             self.assertEqual(audio_hash(merged), audio_hash(output))
             self.assertTrue(os.path.exists(merged))
-            valid, reason = recorder.validate_transcoded_file(output, source_files=[merged, merged])
+            valid, reason = media.validate_transcoded_file(output, source_files=[merged, merged])
             self.assertFalse(valid)
             self.assertEqual(reason, "output_duration_mismatch")
-            with patch.object(recorder, "ffprobe_media_info", side_effect=[(4, []), (4, [("aac", "48000", 1)])]):
-                self.assertEqual(recorder.validate_transcoded_file(output, source_files=[merged]),
+            with patch.object(media, "ffprobe_media_info", side_effect=[(4, []), (4, [("aac", "48000", 1)])]):
+                self.assertEqual(media.validate_transcoded_file(output, source_files=[merged]),
                                  (False, "output_audio_mismatch"))
 
 

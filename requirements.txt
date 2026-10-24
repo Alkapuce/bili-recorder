@@ -1,3 +1,0 @@
-bilibili-api-python
-configparser
-httpx

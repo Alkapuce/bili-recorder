@@ -3,6 +3,12 @@ __pycache__/
 .git/
 .venv/
 config.ini
+config/
+.runtime/
+tests/
+*.egg-info/
+build/
+dist/
 recordings/
 status.json
 status.json.tmp

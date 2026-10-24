@@ -13,25 +13,13 @@ log() {
 }
 
 ensure_runtime_files() {
-  if [ ! -f "$ROOT_DIR/config.ini" ]; then
-    log "[deploy] missing config.ini"
-    log "[deploy] Copy config.example.ini to config.ini and set RoomId before starting."
+  if [ ! -f "$ROOT_DIR/config/local.ini" ]; then
+    log "[deploy] missing config/local.ini"
+    log "[deploy] Copy config/example.ini to config/local.ini and configure rooms before starting."
     exit 1
   fi
 
-  if ! awk -F= '
-    tolower($1) ~ /^[[:space:]]*roomid[[:space:]]*$/ {
-      gsub(/[[:space:]]/, "", $2)
-      if ($2 ~ /^[1-9][0-9]*$/) found=1
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$ROOT_DIR/config.ini"; then
-    log "[deploy] invalid RoomId in config.ini"
-    log "[deploy] Set RoomId to a positive integer before starting."
-    exit 1
-  fi
-
-  mkdir -p "$ROOT_DIR/recordings"
+  mkdir -p "$ROOT_DIR/recordings" "$ROOT_DIR/.runtime"
 }
 
 docker_gpu_ready() {
@@ -70,6 +58,10 @@ if docker_gpu_ready; then
 else
   log "[deploy] GPU unavailable: ${GPU_REASON}"
   log "[deploy] Falling back to CPU mode"
+fi
+
+if [ -f "$ROOT_DIR/config/compose.local.yml" ]; then
+  COMPOSE_FILES+=(-f "$ROOT_DIR/config/compose.local.yml")
 fi
 
 if [ "$#" -eq 0 ]; then

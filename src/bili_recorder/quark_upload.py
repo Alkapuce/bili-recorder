@@ -1,6 +1,5 @@
-"""Upload completed recordings with the official Quark CLI; keep local files."""
+"""Resumable Quark upload, explicit mirroring and verified archival deletion."""
 import argparse
-import configparser
 import fcntl
 import hashlib
 import json
@@ -11,7 +10,8 @@ import secrets
 import subprocess
 import time
 
-from cloud_sync import Alist, completed_files, finish_sync, reconcile
+from .cloud_sync import Alist, completed_files, finish_sync, reconcile
+from .config import read_config
 
 
 def save_json(path, data):
@@ -25,6 +25,14 @@ def upload_pending(path, ledger, key=None):
     stat = path.stat()
     return not (record.get("status") == "uploaded" and record.get("size") == stat.st_size
                 and record.get("mtime_ns") == stat.st_mtime_ns)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def recover_interrupted_upload(path, options, record, session_id, state_dir):
@@ -64,10 +72,7 @@ def recover_interrupted_upload(path, options, record, session_id, state_dir):
 
             parent = options.get("ParentFid", "").strip()
             if not parent:
-                folders = [r for r in browse() if r.get("filename") == "Uploads" and r.get("category") == 0]
-                if len(folders) != 1:
-                    raise RuntimeError("无法唯一确认 CLI 默认上传目录，保留任务")
-                parent = folders[0]["fid"]
+                raise ValueError("恢复已完成上传需要明确的 ParentFid，保留任务")
             matches = [r for r in browse(parent) if r.get("filename") == path.name
                        and r.get("size") == record["size"]]
             if len(matches) != 1:
@@ -109,10 +114,23 @@ def upload_file(path, options, record, session_id, state_dir):
                   remote_path=result.get("data", {}).get("fullPath", ""))
 
 
-def main(config_path="config.ini", enqueue=None):
-    config = configparser.ConfigParser()
-    if not config.read(config_path, encoding="utf-8"):
-        raise FileNotFoundError(config_path)
+def validate_upload_config(config):
+    mode = config.get("Upload", "Mode", fallback="archive").strip().lower()
+    if mode not in {"archive", "mirror"}:
+        raise ValueError("Upload Mode 只支持 archive 或 mirror")
+    delete = config.getboolean("Upload", "DeleteLocal", fallback=False)
+    credentials = config.get("Upload", "AlistCredentials", fallback="").strip()
+    parent = config.get("Upload", "ParentFid", fallback="").strip()
+    if delete and (mode != "archive" or not credentials or not parent or parent == "0"):
+        raise ValueError("DeleteLocal 需要 archive 模式、AList 核验账号和非根目录 ParentFid")
+    if config.getboolean("Upload", "Enabled", fallback=False) and not config.get("Upload", "QuarkCli", fallback="").strip():
+        raise ValueError("启用上传需要指定 QuarkCli")
+    return mode, delete
+
+
+def main(config_path=None, enqueue=None, config=None):
+    config = config if config is not None else read_config(config_path)
+    mode, delete_local = validate_upload_config(config)
     if not config.getboolean("Upload", "Enabled", fallback=False):
         return
     folder = Path(config["General"]["SaveDir"]).resolve()
@@ -129,6 +147,10 @@ def main(config_path="config.ini", enqueue=None):
             return
         ledger_path = state_dir / "manifest.json"
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+        for key in ledger:
+            candidate = folder / key
+            if candidate.is_symlink() or not candidate.resolve().is_relative_to(folder) or key.startswith("."):
+                raise ValueError("上传清单包含不安全路径，保留现场")
         if enqueue:
             archive = Path(enqueue).resolve()
             archive.relative_to(folder)
@@ -141,7 +163,9 @@ def main(config_path="config.ini", enqueue=None):
             save_json(ledger_path, ledger)
             return
         paths = completed_files(folder)
-        paths.update(folder / key for key, record in ledger.items() if record.get("status") != "uploaded")
+        paths.update(folder / key for key, record in ledger.items()
+                     if record.get("status") not in {"uploaded", "archived"}
+                     or (delete_local and record.get("status") == "uploaded"))
         credentials = config["Upload"].get("AlistCredentials", "").strip()
         cloud = Alist(credentials) if credentials else None
         if cloud and not config["Upload"].get("ParentFid", "").strip():
@@ -150,7 +174,7 @@ def main(config_path="config.ini", enqueue=None):
             target_id = cloud.target_id()
             if target_id in ("", "0") or target_id != config["Upload"]["ParentFid"].strip():
                 raise ValueError("AList 账号基本路径必须指向同一个夸克子目录，禁止同步根目录")
-        remote = cloud.files() if cloud else None
+        remote = cloud.files() if cloud and mode == "mirror" else None
         snapshots = {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
                      for p in completed_files(folder)}
         session_id = f"{int(time.time())}-{secrets.token_hex(3)}"
@@ -158,7 +182,12 @@ def main(config_path="config.ini", enqueue=None):
         for path in sorted(paths):
             key = path.resolve().relative_to(folder).as_posix()
             if not path.is_file():
-                if cloud:
+                record = ledger.get(key, {})
+                if delete_local and record.get("delete_verified_at"):
+                    record["status"] = "archived"
+                    save_json(ledger_path, ledger)
+                    continue
+                if cloud and mode == "mirror":
                     continue
                 failures.append(key)
                 logging.error("待上传文件缺失，保留任务: %s", key)
@@ -170,12 +199,8 @@ def main(config_path="config.ini", enqueue=None):
             digest = previous.get("sha256") if (previous.get("size"), previous.get("mtime_ns")) == (
                 stat.st_size, stat.st_mtime_ns) else None
             if not digest:
-                with path.open("rb") as source:
-                    hasher = hashlib.sha256()
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        hasher.update(chunk)
-                    digest = hasher.hexdigest()
-            if cloud:
+                digest = sha256_file(path)
+            if cloud and mode == "mirror":
                 reconcile(path, digest, ledger, cloud, remote)
                 save_json(ledger_path, ledger)
                 if not upload_pending(path, ledger, key):
@@ -184,27 +209,41 @@ def main(config_path="config.ini", enqueue=None):
             if record.get("sha256") != digest:
                 record.clear()
             record.update(sha256=digest, size=stat.st_size, mtime_ns=stat.st_mtime_ns,
-                          status="pending")
+                          status=record.get("status", "pending"))
             save_json(ledger_path, ledger)
             try:
-                recover_interrupted_upload(path, config["Upload"], record, session_id, state_dir)
+                if record.get("status") != "uploaded":
+                    recover_interrupted_upload(path, config["Upload"], record, session_id, state_dir)
                 if record.get("status") != "uploaded":
                     record.setdefault("attempt_started_at", time.time())
                     save_json(ledger_path, ledger)
                     upload_file(path, config["Upload"], record, session_id, state_dir)
                 if path.stat().st_size != stat.st_size or path.stat().st_mtime_ns != stat.st_mtime_ns:
                     raise RuntimeError("上传期间本地文件发生变化")
+                if delete_local:
+                    cloud.verify(path, record)
+                    # Check content again, not only metadata, immediately before deletion.
+                    current_digest = sha256_file(path)
+                    current = path.lstat()
+                    if (path.is_symlink() or current.st_ino != stat.st_ino
+                            or current.st_size != stat.st_size or current.st_mtime_ns != stat.st_mtime_ns
+                            or current_digest != digest):
+                        raise RuntimeError("核验期间本地文件变化，取消删除")
+                    record["delete_verified_at"] = time.time()
+                    save_json(ledger_path, ledger)
+                    path.unlink()
+                    record["status"] = "archived"
                 record.pop("last_error", None)
                 save_json(ledger_path, ledger)
-                logging.info("已上传并确认大小: %s", key)
+                logging.info("%s: %s", "已云端回读核验并归档" if delete_local else "已上传并确认大小", key)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                record.update(status="pending", last_error=str(error)[:200])
+                record.update(last_error=str(error)[:200])
                 save_json(ledger_path, ledger)
                 logging.error("上传失败，保留本地文件，下次重试: %s: %s", key, str(error)[:200])
                 failures.append(key)
         if failures:
             raise RuntimeError(f"{len(failures)} 个文件待重试: {', '.join(failures)}")
-        if cloud:
+        if cloud and mode == "mirror":
             finish_sync(folder, snapshots, ledger, cloud)
             save_json(ledger_path, ledger)
 
@@ -214,4 +253,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enqueue", help="将 recordings 内已整理的 MP4 文件或目录加入上传队列")
     args = parser.parse_args()
-    main(os.environ.get("BILI_CONFIG_PATH", "config.ini"), enqueue=args.enqueue)
+    main(enqueue=args.enqueue)
